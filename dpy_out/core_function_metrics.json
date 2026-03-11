@@ -1,0 +1,83 @@
+[
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Function": "__init__",
+        "LOC": 5,
+        "CC": 1,
+        "PC": 1
+    },
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Function": "list_commits",
+        "LOC": 37,
+        "CC": 6,
+        "PC": 2
+    },
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Function": "_get_person_id",
+        "LOC": 38,
+        "CC": 14,
+        "PC": 2
+    },
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Function": "get_developers",
+        "LOC": 2,
+        "CC": 1,
+        "PC": 0
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Function": "__init__",
+        "LOC": 5,
+        "CC": 1,
+        "PC": 0
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Function": "build_collaboration_network",
+        "LOC": 19,
+        "CC": 7,
+        "PC": 1
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Function": "build_communication_network",
+        "LOC": 7,
+        "CC": 3,
+        "PC": 1
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Function": "build_dependency_network_historical",
+        "LOC": 12,
+        "CC": 5,
+        "PC": 1
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Function": "get_transitive_closure_communication",
+        "LOC": 2,
+        "CC": 1,
+        "PC": 0
+    }
+]

@@ -1,0 +1,16 @@
+fastapi
+uvicorn
+gitpython
+pydantic
+pandas
+networkx
+matplotlib
+scipy
+astunparse
+requests
+python-multipart
+python-dotenv
+pygments
+bandit
+torch
+transformers

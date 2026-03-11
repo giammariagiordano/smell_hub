@@ -1,0 +1,72 @@
+[
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Smell": "Complex method",
+        "Function/Method": "_get_person_id",
+        "Line no": "55 - 98",
+        "File": "/Users/broke31/Desktop/tool/core/miner.py",
+        "Details": "Method '_get_person_id' has a cyclomatic complexity of 14, exceeding the max of 6."
+    },
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Smell": "Long statement",
+        "Function/Method": "list_commits",
+        "Line no": "43",
+        "File": "/Users/broke31/Desktop/tool/core/miner.py",
+        "Details": "A line with 211 chars in list_commits exceeds the maximum length of 120 characters."
+    },
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Smell": "Long statement",
+        "Function/Method": "_get_person_id",
+        "Line no": "86",
+        "File": "/Users/broke31/Desktop/tool/core/miner.py",
+        "Details": "A line with 124 chars in _get_person_id exceeds the maximum length of 120 characters."
+    },
+    {
+        "Package": "core",
+        "Module": "miner",
+        "Class": "RepositoryMiner",
+        "Smell": "Magic number",
+        "Function/Method": "_get_person_id",
+        "Line no": "81",
+        "File": "/Users/broke31/Desktop/tool/core/miner.py",
+        "Details": "Magic number 8 used in _get_person_id."
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Smell": "Complex method",
+        "Function/Method": "build_collaboration_network",
+        "Line no": "12 - 35",
+        "File": "/Users/broke31/Desktop/tool/core/network_builder.py",
+        "Details": "Method 'build_collaboration_network' has a cyclomatic complexity of 7, exceeding the max of 6."
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Smell": "Long identifier",
+        "Function/Method": "build_dependency_network_historical",
+        "Line no": "46",
+        "File": "/Users/broke31/Desktop/tool/core/network_builder.py",
+        "Details": "Identifier'build_dependency_network_historical' exceeds the maximum length of 30 characters."
+    },
+    {
+        "Package": "core",
+        "Module": "network_builder",
+        "Class": "NetworkBuilder",
+        "Smell": "Long identifier",
+        "Function/Method": "get_transitive_closure_communication",
+        "Line no": "60",
+        "File": "/Users/broke31/Desktop/tool/core/network_builder.py",
+        "Details": "Identifier'get_transitive_closure_communication' exceeds the maximum length of 30 characters."
+    }
+]

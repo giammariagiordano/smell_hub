@@ -1,0 +1,13 @@
+{
+  "trained_rows": 1200,
+  "epochs": 1,
+  "batch_size": 16,
+  "labels": [
+    "Anger",
+    "Fear",
+    "Sadness",
+    "Love",
+    "Joy",
+    "Surprise"
+  ]
+}

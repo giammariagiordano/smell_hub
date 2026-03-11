@@ -1,0 +1,92 @@
+                               
+ Usage: DPy analyze [OPTIONS]  
+                               
+ Analyzes the specified Python 
+ project for code smells and   
+ calculate code quality        
+ metrics                       
+                               
+╭─ Options ───────────────────╮
+│ *  --i…  -i      TEXT  The  │
+│                        path │
+│                        to   │
+│                        the  │
+│                        inp… │
+│                        Pyt… │
+│                        file │
+│                        or   │
+│                        dir… │
+│                        for  │
+│                        ana… │
+│                        [de… │
+│                        Non… │
+│                        [re… │
+│ *  --o…  -o      TEXT  The  │
+│                        path │
+│                        to   │
+│                        the  │
+│                        dir… │
+│                        whe… │
+│                        res… │
+│                        will │
+│                        be   │
+│                        sav… │
+│                        [de… │
+│                        Non… │
+│                        [re… │
+│    --f…  -f      TEXT  The  │
+│                        out… │
+│                        for… │
+│                        for  │
+│                        res… │
+│                        e.g… │
+│                        'js… │
+│                        or   │
+│                        'cs… │
+│                        [de… │
+│                        jso… │
+│    --c…  -c      TEXT  The  │
+│                        path │
+│                        to a │
+│                        cus… │
+│                        con… │
+│                        fil… │
+│                        If   │
+│                        not  │
+│                        pro… │
+│                        def… │
+│                        to   │
+│                        'de… │
+│                        in   │
+│                        the  │
+│                        scr… │
+│                        dir… │
+│                        [de… │
+│                        Non… │
+│    --l…  -l      TEXT  The  │
+│                        dir… │
+│                        to   │
+│                        sto… │
+│                        log  │
+│                        fil… │
+│                        Def… │
+│                        to   │
+│                        the  │
+│                        out… │
+│                        dir… │
+│                        if   │
+│                        not  │
+│                        spe… │
+│                        [de… │
+│                        Non… │
+│    --g…  -g            Gen… │
+│                        a    │
+│                        dep… │
+│                        gra… │
+│    --h…                Show │
+│                        this │
+│                        mes… │
+│                        and  │
+│                        exi… │
+╰─────────────────────────────╯
+

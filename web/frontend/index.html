@@ -1,0 +1,225 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Community Smells Hub | Socio-Technical Analysis</title>
+    <link rel="stylesheet" href="style.css?v=20260309-4">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
+    <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+</head>
+
+<body class="dark-theme">
+    <div class="background-blobs">
+        <div class="blob blob-1"></div>
+        <div class="blob blob-2"></div>
+    </div>
+
+    <nav class="glass-nav">
+        <div class="logo">
+            <span class="accent-text">SMELL</span>HUB
+        </div>
+        <div class="nav-links">
+            <button id="addProjectBtn" class="btn-primary">Add Project</button>
+        </div>
+    </nav>
+
+    <main class="content">
+        <section id="projectListSection" class="active">
+            <header class="section-header">
+                <h1>Projects Overview</h1>
+                <p>Monitor your community health and technical debt.</p>
+            </header>
+            <div id="projectGrid" class="project-grid">
+                <!-- Project cards will be injected here -->
+                <div class="loading-spinner"></div>
+            </div>
+        </section>
+
+        <section id="projectDetailSection" class="hidden">
+            <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
+                <button id="backBtn" type="button" class="btn-secondary">← Back to Projects</button>
+                <button id="exportCsvBtn" type="button" class="btn-primary">Export Current Window CSV</button>
+                <button id="exportCsvAllBtn" type="button" class="btn-secondary">Export Full History CSV</button>
+                <button id="reanalyzeBtn" type="button" class="btn-secondary">Re-analyze</button>
+            </div>
+            <div class="detail-container">
+                <div class="sidebar">
+                    <div class="glass-card profile-card">
+                        <h2 id="detailProjectName">Project Name</h2>
+                        <span id="analysisStatus" class="status-badge">Analyzing...</span>
+                        <div style="margin-top:0.6rem; font-size:0.85rem; color:#cbd5e1;">
+                            ML Detector: <span id="mlDetectionStatus">Unknown</span>
+                        </div>
+                        <div class="time-window-controls">
+                            <div class="time-window-header">
+                                <button id="prevWindowBtn" type="button" class="btn-secondary time-window-btn">←</button>
+                                <select id="timeWindowSelect"></select>
+                                <button id="nextWindowBtn" type="button" class="btn-secondary time-window-btn">→</button>
+                            </div>
+                            <div id="timeWindowLabel" class="time-window-label">Current Snapshot</div>
+                        </div>
+                        <div class="metrics-summary">
+                            <div class="metric">
+                                <span class="label">LOC</span>
+                                <span id="metricLoc" class="value">0</span>
+                            </div>
+                            <div class="metric">
+                                <span class="label">NOM</span>
+                                <span id="metricNom" class="value">0</span>
+                            </div>
+                        </div>
+                    </div>
+                    <div class="glass-card">
+                        <h3>Smells Distribution</h3>
+                        <canvas id="smellChart"></canvas>
+                        <div id="communitySmellStatus" class="smell-status"></div>
+                    </div>
+                </div>
+
+                <div class="main-stats">
+                    <div class="glass-card graph-container">
+                        <h3>Socio-Technical Network</h3>
+                        <div id="networkGraph"></div>
+                    </div>
+
+                    <div class="glass-card">
+                        <h3>Developer Classification</h3>
+                        <div id="developerList" class="dev-list">
+                            <!-- Developers will be listed here -->
+                        </div>
+                    </div>
+
+                    <div class="glass-card">
+                        <h3>Developer Analytics</h3>
+                        <div class="dev-summary-grid">
+                            <div class="dev-summary-item">
+                                <span class="label">Developers</span>
+                                <span id="devSummaryCount" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">Total Commits</span>
+                                <span id="devSummaryCommits" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">Bug-Fix Commits</span>
+                                <span id="devSummaryFixes" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">R-SZZ Bug Intro</span>
+                                <span id="devSummaryBugs" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">ML Smell Instances</span>
+                                <span id="devSummaryMlSmells" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">Traditional Smell Instances</span>
+                                <span id="devSummaryTraditionalSmells" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">Vulnerability Instances</span>
+                                <span id="devSummaryVulnInstances" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">High Severity Vulns</span>
+                                <span id="devSummaryVulnHigh" class="value">0</span>
+                            </div>
+                            <div class="dev-summary-item">
+                                <span class="label">Avg Sentiment</span>
+                                <span id="devSummarySentiment" class="value">0.00</span>
+                            </div>
+                        </div>
+                        <div class="dev-charts-grid">
+                            <div class="chart-card">
+                                <h4>Commits Per Developer</h4>
+                                <canvas id="devCommitsChart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Bug Intro vs Bug Fix</h4>
+                                <canvas id="devBugsChart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Code Churn</h4>
+                                <canvas id="devChurnChart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Role Distribution</h4>
+                                <canvas id="devRoleChart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Developer Sentiment Evolution</h4>
+                                <canvas id="devSentimentTimelineChart"></canvas>
+                            </div>
+                            <div class="chart-card">
+                                <h4>ML Smells By Type</h4>
+                                <canvas id="mlSmellTypeChart"></canvas>
+                                <div id="mlSmellStats" class="smell-stats-list"></div>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Traditional Smells By Type</h4>
+                                <canvas id="traditionalSmellTypeChart"></canvas>
+                                <div id="traditionalSmellStats" class="smell-stats-list"></div>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Vulnerabilities By Type (Bandit)</h4>
+                                <canvas id="vulnTypeChart"></canvas>
+                                <div id="vulnTypeStats" class="smell-stats-list"></div>
+                            </div>
+                            <div class="chart-card">
+                                <h4>Vulnerabilities By Severity</h4>
+                                <canvas id="vulnSeverityChart"></canvas>
+                                <div id="vulnSeverityStats" class="smell-stats-list"></div>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="glass-card">
+                        <h3>Socio-Technical Quality Factors</h3>
+                        <div id="communityMetricsReference" class="metrics-ref-container"></div>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+
+    <!-- Modal for adding project -->
+    <div id="addProjectModal" class="modal hidden">
+        <div class="modal-content glass-card">
+            <h2>Track New Project</h2>
+            <form id="addProjectForm">
+                <div class="form-group">
+                    <label>Project Name</label>
+                    <input type="text" id="projName" placeholder="e.g. My AI Core (optional for multiple repos)">
+                </div>
+                <div class="form-group">
+                    <label>Repository URLs</label>
+                    <textarea id="projUrls" required placeholder="https://github.com/org/repo-1.git&#10;https://github.com/org/repo-2.git"></textarea>
+                    <small style="color: var(--text-secondary);">One URL per line (you can also separate with commas).</small>
+                </div>
+                <div style="margin-bottom: 1rem; text-align: right;">
+                    <a href="#" id="toggleAdvanced"
+                        style="font-size: 0.8rem; color: var(--accent-color); text-decoration: none;">Show Advanced
+                        Options</a>
+                </div>
+                <div id="advancedOptions" style="display: none;">
+                    <div class="form-group">
+                        <label>Local Path <span style="color: var(--text-secondary); font-size: 0.8rem;">(optional —
+                                only for single repo, leave blank to auto-clone from URL)</span></label>
+                        <input type="text" id="projPath" placeholder="/absolute/path/to/repo or leave blank">
+                    </div>
+                </div>
+                <div class="modal-actions">
+                    <button type="button" id="closeModal" class="btn-secondary">Cancel</button>
+                    <button type="submit" class="btn-primary">Add & Analyze</button>
+                </div>
+            </form>
+        </div>
+    </div>
+
+    <script src="script.js?v=20260311-13"></script>
+</body>
+
+</html>

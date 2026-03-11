@@ -1,0 +1,24 @@
+2026-03-06 16:15:35 - INFO - [logging.py:15] - License validated successfully.
+2026-03-06 16:15:36 - INFO - [logging.py:15] - License validated successfully.
+2026-03-06 16:15:36 - INFO - [logging.py:15] - License type: LicenseType.Professional
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Parsing ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Parsing package: core
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Second pass of parsing for package: core
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Calculating metrics ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Collect dependencies ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Detecting code smells ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Detecting design smells ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Detecting architecture smells ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Analysis complete.
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Preparing analysis summary ...
+2026-03-06 16:15:36 - INFO - [logging.py:15] - JSON data successfully exported to /Users/broke31/Desktop/tool/dpy_out/core_function_metrics.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Successfully exported JSON data to core_function_metrics.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - JSON data successfully exported to /Users/broke31/Desktop/tool/dpy_out/core_class_module_metrics.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Successfully exported JSON data to core_class_module_metrics.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - JSON data successfully exported to /Users/broke31/Desktop/tool/dpy_out/core_implementation_smells.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Successfully exported JSON data to core_implementation_smells.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - JSON data successfully exported to /Users/broke31/Desktop/tool/dpy_out/core_design_smells.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Successfully exported JSON data to core_design_smells.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - JSON data successfully exported to /Users/broke31/Desktop/tool/dpy_out/core_arch_smells.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Successfully exported JSON data to core_arch_smells.json
+2026-03-06 16:15:36 - INFO - [logging.py:15] - Done.
