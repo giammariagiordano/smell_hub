@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import json
+import hashlib
 from typing import Dict, List, Optional
 
 import pandas as pd
@@ -25,6 +26,7 @@ class DeveloperSentimentAnalyzer:
         self._tokenizer = None
         self._model = None
         self._torch = None
+        self._sentiment_cache: Dict[str, Dict[str, float]] = {}  # h(text) -> emotions dict
 
     @staticmethod
     def emotions_to_sentiment(emotions: Dict[str, float]) -> float:
@@ -98,8 +100,8 @@ class DeveloperSentimentAnalyzer:
             problem_type="multi_label_classification",
         )
 
-        train_df = pd.read_csv(self.train_file)
-        test_df = pd.read_csv(self.test_file)
+        train_df = pd.read_csv(self.train_file, encoding='utf-8')
+        test_df = pd.read_csv(self.test_file, encoding='utf-8')
 
         # Keep training bounded to avoid stalling analysis on first run.
         max_train = target_rows
@@ -231,17 +233,24 @@ class DeveloperSentimentAnalyzer:
                 rows.append(msg[:600])
 
         dev_map = {d.id: d for d in developers}
+        uncached_messages: List[str] = []
+        uncached_hashes: List[str] = []
+        seen_uncached = set()
+        for messages in by_dev.values():
+            for msg in messages:
+                msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+                if msg_hash in self._sentiment_cache or msg_hash in seen_uncached:
+                    continue
+                seen_uncached.add(msg_hash)
+                uncached_messages.append(msg)
+                uncached_hashes.append(msg_hash)
 
-        for dev_id, messages in by_dev.items():
-            dev = dev_map.get(dev_id)
-            if not dev or not messages:
-                continue
-
-            all_scores = []
-            batch_size = 16
+        if uncached_messages:
+            batch_size = int(os.environ.get("DEV_SENTIMENT_INFER_BATCH_SIZE", "64"))
             with torch.no_grad():
-                for i in range(0, len(messages), batch_size):
-                    chunk = messages[i:i + batch_size]
+                for i in range(0, len(uncached_messages), batch_size):
+                    chunk = uncached_messages[i : i + batch_size]
+                    chunk_hashes = uncached_hashes[i : i + batch_size]
                     enc = tokenizer(
                         chunk,
                         truncation=True,
@@ -254,7 +263,23 @@ class DeveloperSentimentAnalyzer:
                         attention_mask=enc["attention_mask"].to(device),
                     )
                     probs = torch.sigmoid(out.logits).cpu().numpy()
-                    all_scores.extend(probs.tolist())
+                    for msg_hash, score_row in zip(chunk_hashes, probs.tolist()):
+                        self._sentiment_cache[msg_hash] = {
+                            label: float(score_row[idx]) for idx, label in enumerate(self.LABELS)
+                        }
+
+        for dev_id, messages in by_dev.items():
+            dev = dev_map.get(dev_id)
+            if not dev or not messages:
+                continue
+
+            all_scores = []
+            for msg in messages:
+                msg_hash = hashlib.sha256(msg.encode("utf-8")).hexdigest()
+                emotions = self._sentiment_cache.get(msg_hash)
+                if not emotions:
+                    continue
+                all_scores.append([float(emotions[label]) for label in self.LABELS])
 
             if not all_scores:
                 continue

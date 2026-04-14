@@ -4,13 +4,14 @@ from models.schemas import ProjectMetrics
 
 class QualityMetricsAnalyzer:
     def analyze_file(self, file_path: str, source_code: str) -> Dict[str, Any]:
+        source_text = source_code or ""
         try:
-            tree = ast.parse(source_code)
+            tree = ast.parse(source_text)
         except:
             return {}
 
         metrics = {
-            'loc': len(source_code.splitlines()),
+            'loc': len(source_text.splitlines()),
             'nom': 0,
             'wmc': 0,
             'cbo': 0,

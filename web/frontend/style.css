@@ -24,6 +24,29 @@ body {
     min-height: 100vh;
 }
 
+select,
+option,
+optgroup {
+    color: #f8fafc;
+    background-color: #182132;
+}
+
+select {
+    border: 1px solid var(--glass-border);
+    border-radius: 8px;
+    color-scheme: dark;
+}
+
+select:focus {
+    outline: 2px solid rgba(99, 102, 241, 0.35);
+    outline-offset: 1px;
+}
+
+option:disabled,
+optgroup {
+    color: #cbd5e1;
+}
+
 /* Background Animations */
 .background-blobs {
     position: fixed;
@@ -399,7 +422,7 @@ h3 {
 .role-evolution-controls select {
     min-width: 140px;
     padding: 0.5rem 0.65rem;
-    background: rgba(255, 255, 255, 0.06);
+    background: #182132;
     border: 1px solid var(--glass-border);
     border-radius: 8px;
     color: var(--text-primary);

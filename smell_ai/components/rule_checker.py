@@ -44,8 +44,7 @@ class RuleChecker:
         extracted_data: dict[str, any],
         filename: str,
         function_name: str,
-        df_output: pd.DataFrame,
-    ) -> pd.DataFrame:
+    ) -> list[dict]:
         """
         Applies all registered smell detectors to the given AST node.
 
@@ -55,23 +54,23 @@ class RuleChecker:
         (e.g., libraries, variables, etc.).
         - filename (str): The name of the file being analyzed.
         - function_name (str): The name of the function node being analyzed.
-        - df_output (pd.DataFrame): The DataFrame to store detected smells.
 
         Returns:
-        - pd.DataFrame: The updated DataFrame containing detected smells.
+        - list[dict]: A list of detected smells.
         """
+        detected = []
         for smell in self.smells:
             try:
                 detected_smells = smell.detect(ast_node, extracted_data)
                 for detected_smell in detected_smells:
-                    df_output.loc[len(df_output)] = {
+                    detected.append({
                         "filename": filename,
                         "function_name": function_name,
                         "smell_name": detected_smell["name"],
                         "line": detected_smell["line"],
                         "description": detected_smell["description"],
                         "additional_info": detected_smell["additional_info"],
-                    }
+                    })
             except Exception as e:
                 print(
                     f"Error in rule checker '{type(smell).__name__}' "
@@ -79,7 +78,7 @@ class RuleChecker:
                     f"in file '{filename}': {e}"
                 )
 
-        return df_output
+        return detected
 
     def _setup_smells(self) -> None:
         """

@@ -3,7 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 from typing import List, Dict, Optional, Tuple, Any
-from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed, Future
 import threading
 import os
 import uuid
@@ -20,6 +20,14 @@ import networkx as nx
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 from pydantic import BaseModel, Field
+import requests
+from requests.adapters import HTTPAdapter
+
+_GITHUB_SESSION = requests.Session()
+_github_adapter = HTTPAdapter(pool_connections=100, pool_maxsize=100)
+_GITHUB_SESSION.mount('https://', _github_adapter)
+_GITHUB_SESSION.mount('http://', _github_adapter)
+
 
 import sys
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -79,8 +87,35 @@ PROJECTS_FILE = os.path.join(DATA_ROOT, "projects.json")
 TOPIC_DOCS_ROOT = os.path.join(DATA_ROOT, "topic_documents")
 LLM_SETTINGS_FILE = os.path.join(DATA_ROOT, "llm_settings.json")
 os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+GITHUB_CACHE_DIR = os.path.join(DATA_ROOT, "github_cache")
 os.makedirs(PROJECTS_ROOT, exist_ok=True)
 os.makedirs(TOPIC_DOCS_ROOT, exist_ok=True)
+os.makedirs(GITHUB_CACHE_DIR, exist_ok=True)
+
+import hashlib
+def _get_url_cache_path(url: str) -> str:
+    h = hashlib.sha256(url.encode("utf-8")).hexdigest()
+    return os.path.join(GITHUB_CACHE_DIR, f"{h}.json")
+
+def _load_persistent_cache(url: str) -> Optional[Any]:
+    path = _get_url_cache_path(url)
+    if os.path.exists(path):
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception:
+            return None
+    return None
+
+def _save_persistent_cache(url: str, data: Any) -> None:
+    if data is None:
+        return
+    path = _get_url_cache_path(url)
+    try:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False)
+    except Exception:
+        pass
 _PROJECTS_IO_LOCK = threading.RLock()
 _PROJECTS_DB_LOCK = threading.RLock()
 _TOPIC_DOCS_LOCK = threading.RLock()
@@ -91,8 +126,8 @@ _GLOBAL_TOPICS_LOCK = threading.RLock()
 _PRONOUN_FILE_CANDIDATES = [
     os.environ.get("PRONOUN_PARADIGMS_FILE", "").strip(),
     os.path.join(RESOURCE_ROOT, "pronoun_paradigms_coling2022.txt"),
+    os.path.join(PROJECT_ROOT, "pronoun_paradigms_coling2022.txt"),
     os.path.join(os.path.dirname(PROJECT_ROOT), "community_smells", "pronoun_paradigms_coling2022.txt"),
-    "/Users/broke31/Desktop/community_smells/pronoun_paradigms_coling2022.txt",
 ]
 _NO_PRONOUN_PHRASES = {
     "no pronouns",
@@ -112,10 +147,187 @@ _DEFAULT_PRONOUN_SETS: Dict[str, set] = {
 _PRONOUN_SETS_CACHE: Optional[Dict[str, set]] = None
 
 
+def _analyze_snapshot_worker(args: Tuple[str, str, str, str, bool, Dict[str, str], Dict[str, Developer]]) -> Dict[str, Any]:
+    (
+        snapshot_hash,
+        source_repo_path,
+        dpy_binary,
+        smell_ai_root,
+        vulnerabilities_enabled,
+        email_to_dev_id,
+        known_dev_ids
+    ) = args
+
+    import tempfile
+    import tarfile
+    import io
+    import subprocess
+    from concurrent.futures import ThreadPoolExecutor
+    from datetime import datetime
+    from typing import List, Dict, Any, Tuple, Optional
+    from analyzers.ml_smells import MLSmellAnalyzer
+    from analyzers.traditional_smells import TraditionalSmellAnalyzer
+    from analyzers.vulnerabilities import BanditVulnerabilityAnalyzer
+
+    ml_analyzer = MLSmellAnalyzer(smell_ai_root=smell_ai_root)
+    traditional_analyzer = TraditionalSmellAnalyzer(dpy_binary=dpy_binary)
+    vuln_analyzer = BanditVulnerabilityAnalyzer() if vulnerabilities_enabled else None
+
+    # We use a temporary directory to avoid collisions between parallel workers
+    with tempfile.TemporaryDirectory(prefix=f"snap_{snapshot_hash[:8]}_") as temp_root:
+        # Extract snapshot to temp_root using git archive (fast and no .git folder needed)
+        try:
+            archive_cmd = ["git", "-C", source_repo_path, "archive", "--format=tar", snapshot_hash]
+            proc = subprocess.run(archive_cmd, capture_output=True, check=True)
+            with io.BytesIO(proc.stdout) as bio:
+                with tarfile.open(fileobj=bio) as tf:
+                    tf.extractall(path=temp_root)
+        except Exception as e:
+            return {
+                "snapshot_hash": snapshot_hash,
+                "error": f"Failed to extract snapshot {snapshot_hash}: {str(e)}",
+            }
+
+        # Run Heavy Analyzers using a ThreadPool inside the process worker
+        snapshot_workers = 3 if vulnerabilities_enabled else 2
+        with ThreadPoolExecutor(max_workers=snapshot_workers) as snapshot_pool:
+            fut_ml = snapshot_pool.submit(ml_analyzer.analyze_directory, temp_root, None)
+            fut_trad = snapshot_pool.submit(
+                traditional_analyzer.analyze_directory,
+                temp_root,
+                email_to_dev_id,
+            )
+            fut_vuln = snapshot_pool.submit(
+                vuln_analyzer.analyze_directory,
+                temp_root,
+                email_to_dev_id,
+            ) if vuln_analyzer else None
+
+            try:
+                snap_ml = fut_ml.result()
+            except Exception as e:
+                snap_ml = []
+
+            try:
+                snap_traditional = fut_trad.result()
+            except Exception as e:
+                snap_traditional = []
+
+            if fut_vuln is not None:
+                try:
+                    snap_vulnerabilities = fut_vuln.result()
+                except Exception:
+                    snap_vulnerabilities = []
+            else:
+                snap_vulnerabilities = []
+
+        # We must attribute in the worker using the original repo for blaming, but the relative paths from the snapshot
+        ml_enriched = _attribute_instances_to_developers_parallel_worker(
+            snap_ml, source_repo_path, snapshot_hash, email_to_dev_id, known_dev_ids
+        )
+        traditional_enriched = _attribute_instances_to_developers_parallel_worker(
+            snap_traditional, source_repo_path, snapshot_hash, email_to_dev_id, known_dev_ids
+        )
+        vulnerabilities_enriched = _attribute_instances_to_developers_parallel_worker(
+            snap_vulnerabilities, source_repo_path, snapshot_hash, email_to_dev_id, known_dev_ids
+        )
+
+        loc_est, nom_est = _compute_loc_nom_for_snapshot(temp_root)
+
+        return {
+            "snapshot_hash": snapshot_hash,
+            "ml_enriched": ml_enriched,
+            "traditional_enriched": traditional_enriched,
+            "vulnerabilities_enriched": vulnerabilities_enriched,
+            "loc": loc_est,
+            "nom": nom_est,
+            "ml_status": ml_analyzer.last_status,
+            "ml_error": ml_analyzer.last_error,
+            "ml_stdout": (ml_analyzer.last_stdout or "")[:4000] or None,
+            "ml_stderr": (ml_analyzer.last_stderr or "")[:4000] or None,
+            "ml_call_graph_nodes": ml_analyzer.last_call_graph_nodes,
+            "ml_call_graph_edges": ml_analyzer.last_call_graph_edges,
+        }
+
+def _attribute_instances_to_developers_parallel_worker(
+    instances: List[Any],
+    repo_path: str,
+    ref: str,
+    email_to_dev_id: Dict[str, str],
+    known_dev_ids: Dict[str, Developer],
+) -> List[Tuple[Any, Optional[datetime]]]:
+    valid_ids = set(known_dev_ids.keys())
+    enriched: List[Tuple[Any, Optional[datetime]]] = []
+
+    for inst in instances:
+        entities = [x for x in getattr(inst, "affected_entities", []) if isinstance(x, str)]
+        file_path = getattr(inst, "file_path", None)
+        line = getattr(inst, "line", None)
+        line_no = int(line) if line else None
+        intro_date: Optional[datetime] = None
+
+        info = None
+        if file_path and line_no:
+            # We use ref in the blame call to ensure we blame the correct version (snapshot)
+            info = _blame_line_info_at_ref(repo_path, ref, file_path, line_no)
+            if info and isinstance(info, dict):
+                intro_date = info.get("author_date")
+
+        if not any(e in valid_ids for e in entities):
+            email = info.get("author_email") if isinstance(info, dict) else None
+            author_id = email_to_dev_id.get(str(email).lower()) if email else None
+            if author_id:
+                inst.affected_entities = [author_id]
+        
+        enriched.append((inst, intro_date))
+    return enriched
+
+def _blame_line_info_at_ref(repo_path: str, ref: str, file_path: Optional[str], line: Optional[int]) -> Optional[Dict[str, object]]:
+    if not file_path or not line:
+        return None
+    
+    # We ensure we have a relative path for git blame
+    rel = file_path
+    if os.path.isabs(file_path):
+        try:
+            rel = os.path.relpath(file_path, repo_path)
+        except Exception:
+            pass
+
+    # Note the 'ref' argument before '--' to blame the specific commit snapshot
+    cmd = ["git", "-C", repo_path, "blame", "--line-porcelain", "-L", f"{line},{line}", ref, "--", rel]
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", check=True)
+        stdout = res.stdout or ""
+        commit_hash = ""
+        author_email = ""
+        author_time = None
+        
+        for row in stdout.splitlines():
+            # Match 40-char SHA1 at start of porcelain output
+            m = re.match(r"^([0-9a-f]{40})", row)
+            if m:
+                commit_hash = m.group(1)
+            elif row.startswith("author-mail "):
+                author_email = row.split(" ", 1)[1].strip("<>")
+            elif row.startswith("author-time "):
+                # author-time is a unix timestamp
+                author_time = datetime.fromtimestamp(int(row.split(" ", 1)[1]))
+                break
+        
+        return {
+            "commit_hash": commit_hash or None,
+            "author_email": author_email or None,
+            "author_date": author_time,
+        }
+    except Exception:
+        return None
+
+
 def load_projects() -> Dict[str, Project]:
     if os.path.exists(PROJECTS_FILE):
         try:
-            with open(PROJECTS_FILE, "r") as f:
+            with open(PROJECTS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
                 return {k: Project(**v) for k, v in data.items()}
         except Exception as e:
@@ -126,7 +338,7 @@ def load_projects() -> Dict[str, Project]:
 def save_projects(db: Dict[str, Project]):
     try:
         with _PROJECTS_IO_LOCK:
-            with open(PROJECTS_FILE, "w") as f:
+            with open(PROJECTS_FILE, "w", encoding="utf-8") as f:
                 data = {k: v.model_dump(mode='json') for k, v in db.items()}
                 json.dump(data, f, indent=4)
     except Exception as e:
@@ -183,6 +395,57 @@ def _effective_github_token() -> str:
         str(stored.get("github_token") or "").strip()
         or os.environ.get("GITHUB_TOKEN", "").strip()
     )
+
+
+def _read_int_env(name: str, default: int, min_value: int = 0) -> int:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return int(default)
+    try:
+        return max(int(min_value), int(raw))
+    except Exception:
+        return int(default)
+
+
+def _github_get_json(
+    url: str,
+    token: str,
+    timeout_sec: int,
+    cache: Optional[Dict[str, Any]] = None,
+    use_persistent_cache: bool = True,
+) -> Optional[Any]:
+    if cache is not None and url in cache:
+        return cache[url]
+
+    if use_persistent_cache:
+        persistent = _load_persistent_cache(url)
+        if persistent is not None:
+            if cache is not None:
+                cache[url] = persistent
+            return persistent
+
+    headers = {
+        "Accept": "application/vnd.github+json",
+        "User-Agent": "community-smells-hub",
+    }
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    
+    try:
+        res = _GITHUB_SESSION.get(url, headers=headers, timeout=timeout_sec)
+        if res.status_code == 200:
+            payload = res.json()
+        else:
+            payload = None
+    except Exception:
+        payload = None
+
+    if use_persistent_cache and payload is not None:
+        _save_persistent_cache(url, payload)
+
+    if cache is not None:
+        cache[url] = payload
+    return payload
 
 
 def _build_llm_settings_response() -> LLMSettingsResponse:
@@ -261,13 +524,20 @@ def _collect_llm_only_documents(project: Project) -> List[Dict[str, Any]]:
         project_end = now + timedelta(seconds=1)
 
     all_developers = miner.get_developers()
+    github_http_cache: Dict[str, Any] = {}
     login_to_dev_id = _build_login_to_dev_id_map(all_developers)
-    login_to_dev_id = _augment_login_to_dev_id_map_with_github_contributors(project.url, all_developers, login_to_dev_id)
-    gh_text_signals_all = _fetch_github_issue_pr_text_signals(
+    login_to_dev_id = _augment_login_to_dev_id_map_with_github_contributors(
+        project.url,
+        all_developers,
+        login_to_dev_id,
+        http_cache=github_http_cache,
+    )
+    _, gh_text_signals_all = _fetch_github_issue_pr_data(
         project.url,
         project_start,
         project_end,
         login_to_dev_id,
+        http_cache=github_http_cache,
     )
     gh_text_by_dev: Dict[str, List[str]] = {}
     for signal in gh_text_signals_all:
@@ -442,6 +712,11 @@ def _adaptive_import_parallelism() -> int:
     return max(2, min(24, cpu * 2))
 
 
+def _adaptive_github_parallelism() -> int:
+    cpu = _machine_cpu_count()
+    return max(8, min(64, cpu * 4))
+
+
 def _read_parallelism_env(name: str, default_value: int) -> int:
     raw = str(os.environ.get(name, "") or "").strip()
     if not raw:
@@ -450,6 +725,23 @@ def _read_parallelism_env(name: str, default_value: int) -> int:
         return max(1, int(raw))
     except Exception:
         return int(default_value)
+
+
+def _read_bool_env(name: str, default_value: bool) -> bool:
+    raw = str(os.environ.get(name, "") or "").strip().lower()
+    if not raw:
+        return bool(default_value)
+    if raw in {"1", "true", "yes", "on"}:
+        return True
+    if raw in {"0", "false", "no", "off"}:
+        return False
+    return bool(default_value)
+
+
+def _is_vulnerability_analysis_enabled(project: Optional[Project] = None) -> bool:
+    if project is not None:
+        return bool(getattr(project, "vulnerability_analysis_enabled", False))
+    return _read_bool_env("ANALYSIS_ENABLE_VULNERABILITIES", True)
 
 
 _ANALYSIS_MAX_WORKERS = _read_parallelism_env("ANALYSIS_PARALLELISM", _adaptive_analysis_parallelism())
@@ -569,7 +861,7 @@ def _load_pronoun_sets() -> Dict[str, set]:
 
     try:
         with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-            text = f.read()
+            text = f.read() or ""
     except Exception:
         _PRONOUN_SETS_CACHE = pronouns
         return pronouns
@@ -660,6 +952,9 @@ def _build_time_windows(commits: List[Commit], months_per_window: int = 1) -> Li
     return windows
 
 
+_BLAME_FILE_CACHE = {}
+_BLAME_CACHE_LOCK = threading.Lock()
+
 def _blame_line_info(repo_path: str, file_path: Optional[str], line: Optional[int]) -> Optional[Dict[str, object]]:
     if not file_path or not line:
         return None
@@ -672,42 +967,75 @@ def _blame_line_info(repo_path: str, file_path: Optional[str], line: Optional[in
     if not os.path.exists(file_abs):
         return None
 
+    with _BLAME_CACHE_LOCK:
+        if file_abs not in _BLAME_FILE_CACHE:
+            _BLAME_FILE_CACHE[file_abs] = {}
+        file_cache = _BLAME_FILE_CACHE[file_abs]
+
+    if file_cache:
+        return file_cache.get(line)
+
     rel = os.path.relpath(file_abs, repo_path)
     cmd = [
-        "git", "-C", repo_path, "blame", "--line-porcelain",
-        "-L", f"{line},{line}", rel,
+        "git", "-C", repo_path, "blame", "--line-porcelain", rel,
     ]
     try:
-        res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+        res = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
     except Exception:
         return None
 
+    stdout = res.stdout or ""
+    current_line = None
     commit_hash = ""
     author_email = ""
     author_time = None
+    
+    parsed_lines = {}
 
-    for idx, row in enumerate(res.stdout.splitlines()):
-        if idx == 0:
-            parts = row.split()
-            if parts:
-                commit_hash = parts[0]
-        if row.startswith("author-mail "):
-            author_email = row.split(" ", 1)[1].strip().strip("<>").lower()
-        elif row.startswith("author-time "):
-            raw = row.split(" ", 1)[1].strip()
+    for row in stdout.splitlines():
+        if row.startswith('\t'):
+            if current_line is not None:
+                parsed_lines[current_line] = {
+                    "commit_hash": commit_hash or None,
+                    "author_email": author_email or None,
+                    "author_date": author_time,
+                }
+            current_line = None
+            commit_hash = ""
+            author_email = ""
+            author_time = None
+            continue
+
+        parts = row.split()
+        if len(parts) >= 3 and len(parts[0]) == 40 and all(c in "0123456789abcdef" for c in parts[0]):
             try:
-                author_time = datetime.fromtimestamp(int(raw))
-            except Exception:
-                author_time = None
+                current_line = int(parts[2])
+                commit_hash = parts[0]
+            except ValueError:
+                pass
+            continue
 
-    if not commit_hash and not author_email and not author_time:
-        return None
+        if current_line is not None:
+            if row.startswith("author-mail "):
+                author_email = row.split(" ", 1)[1].strip().strip("<>").lower()
+            elif row.startswith("author-time "):
+                raw = row.split(" ", 1)[1].strip()
+                try:
+                    author_time = datetime.fromtimestamp(int(raw))
+                except Exception:
+                    author_time = None
 
-    return {
-        "commit_hash": commit_hash or None,
-        "author_email": author_email or None,
-        "author_date": author_time,
-    }
+    with _BLAME_CACHE_LOCK:
+        _BLAME_FILE_CACHE[file_abs] = parsed_lines
+
+    return parsed_lines.get(line)
 
 
 def _clone_developer_identity(dev: Developer) -> Developer:
@@ -880,34 +1208,23 @@ def _augment_login_to_dev_id_map_with_github_contributors(
     project_url: str,
     developers: List[Developer],
     mapping: Dict[str, str],
+    http_cache: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, str]:
     owner, repo = _parse_github_owner_repo(project_url)
     if not owner or not repo or not developers:
         return mapping
 
     token = _effective_github_token()
-    timeout_sec = 6
+    timeout_sec = _read_int_env("GITHUB_HTTP_TIMEOUT_SEC", 6, 1)
     contributor_logins: List[str] = []
 
-    def gh_get(url: str) -> Optional[Any]:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "community-smells-hub",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        req = Request(url, headers=headers, method="GET")
-        try:
-            with urlopen(req, timeout=timeout_sec) as response:
-                if int(response.status) != 200:
-                    return None
-                return json.loads(response.read().decode("utf-8", errors="ignore"))
-        except Exception:
-            return None
-
-    for page in range(1, 4):
-        payload = gh_get(
-            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contributors?per_page=100&page={page}"
+    page = 1
+    while True:
+        payload = _github_get_json(
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contributors?per_page=100&page={page}",
+            token,
+            timeout_sec,
+            http_cache,
         )
         if not isinstance(payload, list) or not payload:
             break
@@ -917,6 +1234,7 @@ def _augment_login_to_dev_id_map_with_github_contributors(
             login = str(item.get("login") or "").strip().lower()
             if login and login not in contributor_logins:
                 contributor_logins.append(login)
+        page += 1
 
     if not contributor_logins:
         return mapping
@@ -984,38 +1302,34 @@ def _build_login_to_dev_id_map(developers: List[Developer]) -> Dict[str, str]:
     return mapping
 
 
-def _fetch_github_issue_pr_interactions(
+def _fetch_github_issue_pr_data(
     project_url: str,
     start: datetime,
     end_exclusive: datetime,
     login_to_dev_id: Dict[str, str],
-) -> List[Tuple[str, str, datetime]]:
+    http_cache: Optional[Dict[str, Any]] = None,
+) -> Tuple[List[Tuple[str, str, datetime]], List[Dict[str, Any]]]:
     owner, repo = _parse_github_owner_repo(project_url)
     if not owner or not repo:
-        return []
+        return [], []
 
     token = _effective_github_token()
-    timeout_sec = 6
+    timeout_sec = _read_int_env("GITHUB_HTTP_TIMEOUT_SEC", 6, 1)
+    fetch_workers = _read_parallelism_env("GITHUB_FETCH_PARALLELISM", _adaptive_github_parallelism())
+    repo_web = _github_repo_web_base(project_url)
 
-    def gh_get(url: str) -> Optional[Any]:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "community-smells-hub",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        req = Request(url, headers=headers, method="GET")
-        try:
-            with urlopen(req, timeout=timeout_sec) as res:
-                if int(res.status) != 200:
-                    return None
-                return json.loads(res.read().decode("utf-8", errors="ignore"))
-        except Exception:
-            return None
-
-    def add_pairwise_interactions(participants: set, ts: datetime, out: List[Tuple[str, str, datetime]], seen: set):
-        ids = sorted({_resolve_dev_id_from_login(p, login_to_dev_id) for p in participants if _resolve_dev_id_from_login(p, login_to_dev_id)})
-        ids = [x for x in ids if x]
+    def add_pairwise_interactions(
+        participants: set,
+        ts: datetime,
+        out: List[Tuple[str, str, datetime]],
+        seen: set,
+    ) -> None:
+        resolved_ids = []
+        for participant in participants:
+            dev_id = _resolve_dev_id_from_login(participant, login_to_dev_id)
+            if dev_id:
+                resolved_ids.append(dev_id)
+        ids = sorted(set(resolved_ids))
         if len(ids) < 2:
             return
         for i, a in enumerate(ids):
@@ -1026,124 +1340,6 @@ def _fetch_github_issue_pr_interactions(
                 seen.add(key)
                 out.append((a, b, ts))
                 out.append((b, a, ts))
-
-    interactions: List[Tuple[str, str, datetime]] = []
-    seen = set()
-
-    since_iso = start.isoformat() + "Z"
-    for page in range(1, 6):
-        issues = gh_get(
-            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues"
-            f"?state=all&since={quote(since_iso)}&per_page=100&page={page}&sort=updated&direction=asc"
-        )
-        if not isinstance(issues, list) or not issues:
-            break
-
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            number = issue.get("number")
-            if not number:
-                continue
-            issue_dt = _parse_github_datetime(issue.get("updated_at") or issue.get("created_at"))
-            if not issue_dt or issue_dt < start or issue_dt >= end_exclusive:
-                continue
-
-            participants = set()
-            user = issue.get("user") or {}
-            login = str(user.get("login") or "").strip()
-            if login:
-                participants.add(login)
-
-            for assignee in issue.get("assignees") or []:
-                if isinstance(assignee, dict):
-                    l = str(assignee.get("login") or "").strip()
-                    if l:
-                        participants.add(l)
-
-            comments = gh_get(
-                f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues/{number}/comments?per_page=100"
-            )
-            if isinstance(comments, list):
-                for c in comments:
-                    if not isinstance(c, dict):
-                        continue
-                    cdt = _parse_github_datetime(c.get("created_at"))
-                    if not cdt or cdt < start or cdt >= end_exclusive:
-                        continue
-                    cu = c.get("user") or {}
-                    cl = str(cu.get("login") or "").strip()
-                    if cl:
-                        participants.add(cl)
-                        add_pairwise_interactions(participants, cdt, interactions, seen)
-
-            # Pull request specific interactions.
-            if "pull_request" in issue:
-                reviews = gh_get(
-                    f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/reviews?per_page=100"
-                )
-                if isinstance(reviews, list):
-                    for r in reviews:
-                        if not isinstance(r, dict):
-                            continue
-                        rdt = _parse_github_datetime(r.get("submitted_at") or r.get("created_at"))
-                        if not rdt or rdt < start or rdt >= end_exclusive:
-                            continue
-                        ru = r.get("user") or {}
-                        rl = str(ru.get("login") or "").strip()
-                        if rl:
-                            participants.add(rl)
-                            add_pairwise_interactions(participants, rdt, interactions, seen)
-
-                pr_comments = gh_get(
-                    f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/comments?per_page=100"
-                )
-                if isinstance(pr_comments, list):
-                    for c in pr_comments:
-                        if not isinstance(c, dict):
-                            continue
-                        pdt = _parse_github_datetime(c.get("created_at"))
-                        if not pdt or pdt < start or pdt >= end_exclusive:
-                            continue
-                        pu = c.get("user") or {}
-                        pl = str(pu.get("login") or "").strip()
-                        if pl:
-                            participants.add(pl)
-                            add_pairwise_interactions(participants, pdt, interactions, seen)
-
-            add_pairwise_interactions(participants, issue_dt, interactions, seen)
-
-    return interactions
-
-
-def _fetch_github_issue_pr_text_signals(
-    project_url: str,
-    start: datetime,
-    end_exclusive: datetime,
-    login_to_dev_id: Dict[str, str],
-) -> List[Dict[str, Any]]:
-    owner, repo = _parse_github_owner_repo(project_url)
-    if not owner or not repo:
-        return []
-
-    token = _effective_github_token()
-    timeout_sec = 6
-
-    def gh_get(url: str) -> Optional[Any]:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "community-smells-hub",
-        }
-        if token:
-            headers["Authorization"] = f"Bearer {token}"
-        req = Request(url, headers=headers, method="GET")
-        try:
-            with urlopen(req, timeout=timeout_sec) as res:
-                if int(res.status) != 200:
-                    return None
-                return json.loads(res.read().decode("utf-8", errors="ignore"))
-        except Exception:
-            return None
 
     def add_signal(
         out: List[Dict[str, Any]],
@@ -1160,7 +1356,7 @@ def _fetch_github_issue_pr_text_signals(
         thread_label: str,
         thread_url: str,
         thread_is_open: bool,
-    ):
+    ) -> None:
         if not ts or ts < start or ts >= end_exclusive:
             return
         dev_id = _resolve_dev_id_from_login(login, login_to_dev_id)
@@ -1183,73 +1379,139 @@ def _fetch_github_issue_pr_text_signals(
                 "thread_is_open": bool(thread_is_open),
             })
 
-    signals: List[Dict[str, Any]] = []
     since_iso = start.isoformat() + "Z"
-    repo_web = _github_repo_web_base(project_url)
-
-    for page in range(1, 6):
-        issues = gh_get(
+    issues: List[Dict[str, Any]] = []
+    page = 1
+    while True:
+        payload = _github_get_json(
             f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues"
-            f"?state=all&since={quote(since_iso)}&per_page=100&page={page}&sort=updated&direction=asc"
+            f"?state=all&since={quote(since_iso)}&per_page=100&page={page}&sort=updated&direction=asc",
+            token,
+            timeout_sec,
+            http_cache,
         )
-        if not isinstance(issues, list) or not issues:
+        if not isinstance(payload, list) or not payload:
             break
+        for issue in payload:
+            if isinstance(issue, dict):
+                issues.append(issue)
+        page += 1
 
-        for issue in issues:
-            if not isinstance(issue, dict):
-                continue
-            number = issue.get("number")
-            if not number:
-                continue
-            issue_ts = _parse_github_datetime(issue.get("updated_at") or issue.get("created_at"))
-            if not issue_ts or issue_ts < start or issue_ts >= end_exclusive:
-                continue
-            is_pr = "pull_request" in issue
-            thread_type = "pr" if is_pr else "issue"
-            thread_id = f"{thread_type}:{number}"
-            issue_title = str(issue.get("title") or f"{thread_type.upper()} #{number}")
-            thread_label = f"{'PR' if is_pr else 'Issue'} #{number}: {issue_title}"
-            thread_url = str(issue.get("html_url") or f"{repo_web}/{ 'pull' if is_pr else 'issues' }/{number}")
-            thread_is_open = str(issue.get("state") or "").strip().lower() == "open"
+    if not issues:
+        return [], []
 
-            iu = issue.get("user") or {}
-            ilogin = str(iu.get("login") or "").strip()
-            add_signal(
-                signals,
-                ilogin,
-                issue_ts,
-                [str(issue.get("title") or ""), str(issue.get("body") or "")],
-                source_id=thread_id,
-                source_label=thread_label,
-                source_url=thread_url,
-                source_type="pull_request" if is_pr else "issue",
-                is_open=thread_is_open,
-                thread_id=thread_id,
-                thread_label=thread_label,
-                thread_url=thread_url,
-                thread_is_open=thread_is_open,
+    def process_issue(issue: Dict[str, Any]) -> Tuple[List[Tuple[str, str, datetime]], List[Dict[str, Any]]]:
+        local_interactions: List[Tuple[str, str, datetime]] = []
+        local_signals: List[Dict[str, Any]] = []
+        local_seen = set()
+
+        number = issue.get("number")
+        if not number:
+            return local_interactions, local_signals
+
+        issue_ts = _parse_github_datetime(issue.get("updated_at") or issue.get("created_at"))
+        if not issue_ts or issue_ts < start or issue_ts >= end_exclusive:
+            return local_interactions, local_signals
+
+        is_pr = "pull_request" in issue
+        thread_type = "pr" if is_pr else "issue"
+        thread_id = f"{thread_type}:{number}"
+        issue_title = str(issue.get("title") or f"{thread_type.upper()} #{number}")
+        thread_label = f"{'PR' if is_pr else 'Issue'} #{number}: {issue_title}"
+        thread_url = str(issue.get("html_url") or f"{repo_web}/{ 'pull' if is_pr else 'issues' }/{number}")
+        thread_is_open = str(issue.get("state") or "").strip().lower() == "open"
+
+        participants = set()
+        iu = issue.get("user") or {}
+        ilogin = str(iu.get("login") or "").strip()
+        if ilogin:
+            participants.add(ilogin)
+
+        for assignee in issue.get("assignees") or []:
+            if isinstance(assignee, dict):
+                assignee_login = str(assignee.get("login") or "").strip()
+                if assignee_login:
+                    participants.add(assignee_login)
+
+        add_signal(
+            local_signals,
+            ilogin,
+            issue_ts,
+            [str(issue.get("title") or ""), str(issue.get("body") or "")],
+            source_id=thread_id,
+            source_label=thread_label,
+            source_url=thread_url,
+            source_type="pull_request" if is_pr else "issue",
+            is_open=thread_is_open,
+            thread_id=thread_id,
+            thread_label=thread_label,
+            thread_url=thread_url,
+            thread_is_open=thread_is_open,
+        )
+
+        comments = _github_get_json(
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues/{number}/comments?per_page=100",
+            token,
+            timeout_sec,
+            http_cache,
+        )
+        if isinstance(comments, list):
+            for c in comments:
+                if not isinstance(c, dict):
+                    continue
+                cts = _parse_github_datetime(c.get("created_at"))
+                if not cts or cts < start or cts >= end_exclusive:
+                    continue
+                cu = c.get("user") or {}
+                clogin = str(cu.get("login") or "").strip()
+                if clogin:
+                    participants.add(clogin)
+                    add_pairwise_interactions(participants, cts, local_interactions, local_seen)
+                comment_id = str(c.get("id") or "")
+                add_signal(
+                    local_signals,
+                    clogin,
+                    cts,
+                    [str(c.get("body") or "")],
+                    source_id=f"{thread_id}:comment:{comment_id or 'x'}",
+                    source_label=f"{thread_label} comment",
+                    source_url=str(c.get("html_url") or thread_url),
+                    source_type="issue_comment",
+                    is_open=thread_is_open,
+                    thread_id=thread_id,
+                    thread_label=thread_label,
+                    thread_url=thread_url,
+                    thread_is_open=thread_is_open,
+                )
+
+        if is_pr:
+            reviews = _github_get_json(
+                f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/reviews?per_page=100",
+                token,
+                timeout_sec,
+                http_cache,
             )
-
-            comments = gh_get(
-                f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues/{number}/comments?per_page=100"
-            )
-            if isinstance(comments, list):
-                for c in comments:
-                    if not isinstance(c, dict):
+            if isinstance(reviews, list):
+                for r in reviews:
+                    if not isinstance(r, dict):
                         continue
-                    cts = _parse_github_datetime(c.get("created_at"))
-                    cu = c.get("user") or {}
-                    clogin = str(cu.get("login") or "").strip()
-                    comment_id = str(c.get("id") or "")
+                    rts = _parse_github_datetime(r.get("submitted_at") or r.get("created_at"))
+                    if not rts or rts < start or rts >= end_exclusive:
+                        continue
+                    ru = r.get("user") or {}
+                    rlogin = str(ru.get("login") or "").strip()
+                    if rlogin:
+                        participants.add(rlogin)
+                        add_pairwise_interactions(participants, rts, local_interactions, local_seen)
                     add_signal(
-                        signals,
-                        clogin,
-                        cts,
-                        [str(c.get("body") or "")],
-                        source_id=f"{thread_id}:comment:{comment_id or 'x'}",
-                        source_label=f"{thread_label} comment",
-                        source_url=str(c.get("html_url") or thread_url),
-                        source_type="issue_comment",
+                        local_signals,
+                        rlogin,
+                        rts,
+                        [str(r.get("state") or ""), str(r.get("body") or "")],
+                        source_id=f"{thread_id}:review:{str(r.get('id') or 'x')}",
+                        source_label=f"{thread_label} review",
+                        source_url=str(r.get("html_url") or thread_url),
+                        source_type="review",
                         is_open=thread_is_open,
                         thread_id=thread_id,
                         thread_label=thread_label,
@@ -1257,59 +1519,99 @@ def _fetch_github_issue_pr_text_signals(
                         thread_is_open=thread_is_open,
                     )
 
-            if is_pr:
-                reviews = gh_get(
-                    f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/reviews?per_page=100"
-                )
-                if isinstance(reviews, list):
-                    for r in reviews:
-                        if not isinstance(r, dict):
-                            continue
-                        rts = _parse_github_datetime(r.get("submitted_at") or r.get("created_at"))
-                        ru = r.get("user") or {}
-                        rlogin = str(ru.get("login") or "").strip()
-                        add_signal(
-                            signals,
-                            rlogin,
-                            rts,
-                            [str(r.get("state") or ""), str(r.get("body") or "")],
-                            source_id=f"{thread_id}:review:{str(r.get('id') or 'x')}",
-                            source_label=f"{thread_label} review",
-                            source_url=str(r.get("html_url") or thread_url),
-                            source_type="review",
-                            is_open=thread_is_open,
-                            thread_id=thread_id,
-                            thread_label=thread_label,
-                            thread_url=thread_url,
-                            thread_is_open=thread_is_open,
-                        )
+            pr_comments = _github_get_json(
+                f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/comments?per_page=100",
+                token,
+                timeout_sec,
+                http_cache,
+            )
+            if isinstance(pr_comments, list):
+                for c in pr_comments:
+                    if not isinstance(c, dict):
+                        continue
+                    pts = _parse_github_datetime(c.get("created_at"))
+                    if not pts or pts < start or pts >= end_exclusive:
+                        continue
+                    pu = c.get("user") or {}
+                    plogin = str(pu.get("login") or "").strip()
+                    if plogin:
+                        participants.add(plogin)
+                        add_pairwise_interactions(participants, pts, local_interactions, local_seen)
+                    add_signal(
+                        local_signals,
+                        plogin,
+                        pts,
+                        [str(c.get("body") or "")],
+                        source_id=f"{thread_id}:pr_comment:{str(c.get('id') or 'x')}",
+                        source_label=f"{thread_label} inline comment",
+                        source_url=str(c.get("html_url") or thread_url),
+                        source_type="pr_comment",
+                        is_open=thread_is_open,
+                        thread_id=thread_id,
+                        thread_label=thread_label,
+                        thread_url=thread_url,
+                        thread_is_open=thread_is_open,
+                    )
 
-                pr_comments = gh_get(
-                    f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/comments?per_page=100"
-                )
-                if isinstance(pr_comments, list):
-                    for c in pr_comments:
-                        if not isinstance(c, dict):
-                            continue
-                        pts = _parse_github_datetime(c.get("created_at"))
-                        pu = c.get("user") or {}
-                        plogin = str(pu.get("login") or "").strip()
-                        add_signal(
-                            signals,
-                            plogin,
-                            pts,
-                            [str(c.get("body") or "")],
-                            source_id=f"{thread_id}:pr_comment:{str(c.get('id') or 'x')}",
-                            source_label=f"{thread_label} inline comment",
-                            source_url=str(c.get("html_url") or thread_url),
-                            source_type="pr_comment",
-                            is_open=thread_is_open,
-                            thread_id=thread_id,
-                            thread_label=thread_label,
-                            thread_url=thread_url,
-                            thread_is_open=thread_is_open,
-                        )
+        add_pairwise_interactions(participants, issue_ts, local_interactions, local_seen)
+        return local_interactions, local_signals
 
+    interactions: List[Tuple[str, str, datetime]] = []
+    signals: List[Dict[str, Any]] = []
+    seen = set()
+
+    workers = min(len(issues), max(1, fetch_workers))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+        futures = [pool.submit(process_issue, issue) for issue in issues]
+        for fut in as_completed(futures):
+            try:
+                issue_interactions, issue_signals = fut.result()
+            except Exception:
+                continue
+            for item in issue_interactions:
+                key = (item[0], item[1], item[2].date().isoformat())
+                if key in seen:
+                    continue
+                seen.add(key)
+                interactions.append(item)
+            signals.extend(issue_signals)
+
+    interactions.sort(key=lambda x: x[2])
+    signals.sort(key=lambda x: x.get("timestamp") or datetime.min)
+    return interactions, signals
+
+
+def _fetch_github_issue_pr_interactions(
+    project_url: str,
+    start: datetime,
+    end_exclusive: datetime,
+    login_to_dev_id: Dict[str, str],
+    http_cache: Optional[Dict[str, Any]] = None,
+) -> List[Tuple[str, str, datetime]]:
+    interactions, _ = _fetch_github_issue_pr_data(
+        project_url,
+        start,
+        end_exclusive,
+        login_to_dev_id,
+        http_cache=http_cache,
+    )
+    return interactions
+
+
+def _fetch_github_issue_pr_text_signals(
+    project_url: str,
+    start: datetime,
+    end_exclusive: datetime,
+    login_to_dev_id: Dict[str, str],
+    http_cache: Optional[Dict[str, Any]] = None,
+) -> List[Dict[str, Any]]:
+    _, signals = _fetch_github_issue_pr_data(
+        project_url,
+        start,
+        end_exclusive,
+        login_to_dev_id,
+        http_cache=http_cache,
+    )
     return signals
 
 
@@ -1373,21 +1675,13 @@ class GitHubGenderResolver:
         self.contributor_logins: Optional[List[str]] = None
 
     def _get_json(self, url: str) -> Optional[Any]:
-        headers = {
-            "Accept": "application/vnd.github+json",
-            "User-Agent": "community-smells-hub",
-        }
-        if self.github_token:
-            headers["Authorization"] = f"Bearer {self.github_token}"
-
-        req = Request(url, headers=headers, method="GET")
-        try:
-            with urlopen(req, timeout=self.timeout_sec) as response:
-                if int(response.status) != 200:
-                    return None
-                return json.loads(response.read().decode("utf-8", errors="ignore"))
-        except Exception:
-            return None
+        return _github_get_json(
+            url,
+            self.github_token,
+            self.timeout_sec,
+            cache=self.user_cache,
+            use_persistent_cache=True
+        )
 
     def _fetch_user(self, login: str) -> Optional[Dict[str, Any]]:
         login = (login or "").strip()
@@ -1413,7 +1707,8 @@ class GitHubGenderResolver:
         if not self.owner or not self.repo:
             return self.contributor_logins
 
-        for page in range(1, 3):
+        page = 1
+        while True:
             payload = self._get_json(
                 f"https://api.github.com/repos/{quote(self.owner)}/{quote(self.repo)}/contributors?per_page=100&page={page}"
             )
@@ -1425,6 +1720,7 @@ class GitHubGenderResolver:
                 login = str(item.get("login", "")).strip()
                 if login and login not in self.contributor_logins:
                     self.contributor_logins.append(login)
+            page += 1
 
         return self.contributor_logins
 
@@ -1521,6 +1817,37 @@ class GitHubGenderResolver:
         dev.gender_source = "github_bio_pronouns" if gender != "Unknown" else "github_bio_unresolved"
 
     def annotate_developers(self, developers: List[Developer]) -> None:
+        unique_logins: List[str] = []
+        seen = set()
+        for dev in developers:
+            for login in self._build_candidate_logins(dev):
+                if login not in seen:
+                    seen.add(login)
+                    unique_logins.append(login)
+
+        if self.max_profile_lookups:
+            unique_logins = unique_logins[: self.max_profile_lookups]
+
+        if unique_logins:
+            workers = min(
+                len(unique_logins),
+                _read_parallelism_env("GITHUB_PROFILE_PARALLELISM", _adaptive_github_parallelism()),
+            )
+            with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+                futures = {
+                    pool.submit(self._get_json, f"https://api.github.com/users/{quote(login)}"): login
+                    for login in unique_logins
+                }
+                for fut in as_completed(futures):
+                    login = futures[fut]
+                    try:
+                        payload = fut.result()
+                    except Exception:
+                        payload = None
+                    self.user_cache[login] = payload if isinstance(payload, dict) else None
+
+            self.lookup_count = len(self.user_cache)
+
         for dev in developers:
             self.annotate_developer(dev)
 
@@ -1953,15 +2280,49 @@ def _ensure_project_repo_available(project: Project) -> None:
 
 
 def _clone_repo_for_history(source_repo_path: str) -> str:
-    clone_dir = tempfile.mkdtemp(prefix="history_repo_", dir="/tmp")
+    clone_dir = tempfile.mkdtemp(prefix="history_repo_")
     cmd = ["git", "clone", "--quiet", "--no-checkout", source_repo_path, clone_dir]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
     return clone_dir
 
 
 def _checkout_ref(repo_path: str, ref: str) -> None:
     cmd = ["git", "-C", repo_path, "checkout", "--quiet", ref]
-    subprocess.run(cmd, check=True, capture_output=True, text=True)
+    subprocess.run(
+        cmd,
+        check=True,
+        capture_output=True,
+        text=True,
+        encoding="utf-8",
+        errors="replace",
+    )
+
+
+def _load_snapshot_cache(project_id: str) -> Dict[str, Any]:
+    cache_path = os.path.join(PROJECTS_ROOT, f"{project_id}_snapshots.json")
+    if os.path.exists(cache_path):
+        try:
+            with open(cache_path, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            print(f"Error loading snapshot cache for {project_id}: {e}")
+    return {}
+
+
+def _save_snapshot_cache(project_id: str, cache: Dict[str, Any]) -> None:
+    cache_path = os.path.join(PROJECTS_ROOT, f"{project_id}_snapshots.json")
+    try:
+        with open(cache_path, "w", encoding="utf-8") as f:
+            json.dump(cache, f, indent=4)
+    except Exception as e:
+        print(f"Error saving snapshot cache for {project_id}: {e}")
 
 
 def _compute_loc_nom_for_snapshot(repo_path: str) -> Tuple[int, int]:
@@ -1988,7 +2349,7 @@ def _compute_loc_nom_for_snapshot(repo_path: str) -> Tuple[int, int]:
             file_path = os.path.join(root, name)
             try:
                 with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
-                    src = f.read()
+                    src = f.read() or ""
             except Exception:
                 continue
 
@@ -2014,6 +2375,72 @@ def _to_repo_relative_path(file_path: Optional[str], repo_path: str) -> str:
         return file_path
     except Exception:
         return file_path or "Unknown"
+
+
+def _analyze_snapshot_worker(
+    project_local_path_for_clone: str,
+    snapshot_hash: str,
+    email_to_dev_id: Dict[str, str],
+    base_dev_by_id: Dict[str, Developer],
+    dpy_binary: Optional[str],
+    vulnerabilities_enabled: bool,
+) -> Dict[str, Any]:
+    if not snapshot_hash:
+        return {
+            "ml_enriched": [],
+            "traditional_enriched": [],
+            "vulnerabilities_enriched": [],
+            "loc": 0,
+            "nom": 0,
+            "ml_status": "No commit hash",
+            "ml_error": None,
+            "ml_stdout": None,
+            "ml_stderr": None,
+            "ml_call_graph_nodes": [],
+            "ml_call_graph_edges": [],
+        }
+
+    repo_path = _clone_repo_for_history(project_local_path_for_clone)
+    try:
+        _checkout_ref(repo_path, snapshot_hash)
+
+        # Instantiate analyzers for this worker
+        ml_analyzer = MLSmellAnalyzer(os.path.join(RESOURCE_ROOT, "smell_ai"))
+        traditional_analyzer = TraditionalSmellAnalyzer(dpy_binary=dpy_binary)
+        vuln_analyzer = BanditVulnerabilityAnalyzer() if vulnerabilities_enabled else None
+
+        snap_ml = ml_analyzer.analyze_directory(repo_path, None)
+        snap_traditional = traditional_analyzer.analyze_directory(repo_path, email_to_dev_id)
+        snap_vulnerabilities = vuln_analyzer.analyze_directory(repo_path, email_to_dev_id) if vuln_analyzer else []
+
+        ml_enriched = _attribute_instances_to_developers(
+            snap_ml, repo_path, email_to_dev_id, base_dev_by_id
+        )
+        traditional_enriched = _attribute_instances_to_developers(
+            snap_traditional, repo_path, email_to_dev_id, base_dev_by_id
+        )
+        vulnerabilities_enriched = _attribute_instances_to_developers(
+            snap_vulnerabilities, repo_path, email_to_dev_id, base_dev_by_id
+        )
+
+        loc, nom = _compute_loc_nom_for_snapshot(repo_path)
+
+        return {
+            "ml_enriched": ml_enriched,
+            "traditional_enriched": traditional_enriched,
+            "vulnerabilities_enriched": vulnerabilities_enriched,
+            "loc": loc,
+            "nom": nom,
+            "ml_status": ml_analyzer.last_status,
+            "ml_error": ml_analyzer.last_error,
+            "ml_stdout": (ml_analyzer.last_stdout or "")[:4000] or None,
+            "ml_stderr": (ml_analyzer.last_stderr or "")[:4000] or None,
+            "ml_call_graph_nodes": ml_analyzer.last_call_graph_nodes,
+            "ml_call_graph_edges": ml_analyzer.last_call_graph_edges,
+        }
+    finally:
+        if os.path.exists(repo_path):
+            shutil.rmtree(repo_path, ignore_errors=True)
 
 
 def _attribute_instances_to_developers(
@@ -2061,14 +2488,77 @@ def _sanitize_repo_slug(url: str) -> str:
 
 
 def _resolve_dpy_binary() -> Optional[str]:
+    def _matches_current_platform(path: str) -> bool:
+        try:
+            with open(path, "rb") as f:
+                header = f.read(4)
+        except OSError:
+            return False
+
+        if header.startswith(b"#!"):
+            return True
+
+        is_windows_bin = header.startswith(b"MZ")
+        is_linux_bin = header.startswith(b"\x7fELF")
+        is_macos_bin = header in {
+            b"\xCF\xFA\xED\xFE",
+            b"\xFE\xED\xFA\xCF",
+            b"\xCA\xFE\xBA\xBE",
+            b"\xBE\xBA\xFE\xCA",
+            b"\xCA\xFE\xBA\xBF",
+            b"\xBF\xBA\xFE\xCA",
+        }
+
+        if sys.platform.startswith("win"):
+            return not (is_linux_bin or is_macos_bin)
+        if sys.platform == "darwin":
+            return not (is_linux_bin or is_windows_bin)
+        return not (is_windows_bin or is_macos_bin)
+
     candidates: List[str] = []
     env_path = (os.environ.get("DPY_BINARY", "") or "").strip()
     if env_path:
         candidates.append(os.path.expanduser(env_path))
 
+    folder_candidates: List[Tuple[str, ...]] = []
+    if sys.platform.startswith("win"):
+        folder_candidates.extend([
+            ("DPy_WINDOWS", "DPy.exe"),
+            ("DPy_WINDOWS", "DPy"),
+        ])
+    elif sys.platform == "darwin":
+        folder_candidates.extend([
+            ("DPy_MACOS", "DPy"),
+            ("DPy_MACOS", "dpy"),
+        ])
+    else:
+        folder_candidates.extend([
+            ("DPy_LINUX", "DPy"),
+            ("DPy_LINUX", "dpy"),
+        ])
+
+    # Also consider sibling platform folders as generic fallbacks when the
+    # current platform-specific directory is missing.
+    folder_candidates.extend([
+        ("DPy_WINDOWS", "DPy.exe"),
+        ("DPy_WINDOWS", "DPy"),
+        ("DPy_MACOS", "DPy"),
+        ("DPy_MACOS", "dpy"),
+        ("DPy_LINUX", "DPy"),
+        ("DPy_LINUX", "dpy"),
+    ])
+    for parts in folder_candidates:
+        candidates.append(os.path.join(RESOURCE_ROOT, *parts))
+
     name_candidates = [
         "DPy",
         "dpy",
+        "DPy-macos",
+        "DPy-macos-arm64",
+        "DPy-macos-x86_64",
+        "DPy-darwin",
+        "DPy-darwin-arm64",
+        "DPy-darwin-x86_64",
         "DPy-linux",
         "DPy-linux-x86_64",
         "DPy-linux-amd64",
@@ -2091,13 +2581,15 @@ def _resolve_dpy_binary() -> Optional[str]:
         seen.add(p)
         if not os.path.isfile(p):
             continue
-        if not os.access(p, os.X_OK):
+        if not _matches_current_platform(p):
+            continue
+        if os.name != "nt" and not os.access(p, os.X_OK):
             try:
                 mode = os.stat(p).st_mode
                 os.chmod(p, mode | 0o111)
             except Exception:
                 pass
-        if os.access(p, os.X_OK):
+        if os.name == "nt" or os.access(p, os.X_OK):
             return p
     return None
 
@@ -2138,6 +2630,8 @@ def _git_clone_with_timeout(url: str, dest_path: str) -> None:
             check=False,
             capture_output=True,
             text=True,
+            encoding="utf-8",
+            errors="replace",
             timeout=max(timeout_sec, 10),
         )
     except subprocess.TimeoutExpired:
@@ -2163,10 +2657,46 @@ def _git_clone_with_timeout(url: str, dest_path: str) -> None:
     )
 
 
+def _path_is_git_repository(path: str) -> bool:
+    if not path:
+        return False
+    git_marker = os.path.join(path, ".git")
+    return os.path.isdir(path) and os.path.exists(git_marker)
+
+
+def _discover_git_repositories(root_path: str) -> List[str]:
+    if not root_path:
+        return []
+    abs_root = os.path.abspath(root_path)
+    if _path_is_git_repository(abs_root):
+        return [abs_root]
+    if not os.path.isdir(abs_root):
+        return []
+
+    skip_dirs = {
+        ".venv", "venv", "__pycache__", "node_modules",
+        ".mypy_cache", ".pytest_cache", ".ruff_cache",
+    }
+    discovered: List[str] = []
+    seen: set = set()
+    for current_root, dirnames, filenames in os.walk(abs_root):
+        dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+        if ".git" in dirnames or ".git" in filenames:
+            repo_path = os.path.abspath(current_root)
+            repo_key = os.path.normcase(os.path.normpath(repo_path))
+            if repo_key not in seen:
+                seen.add(repo_key)
+                discovered.append(repo_path)
+            dirnames[:] = []
+    discovered.sort()
+    return discovered
+
+
 def _create_project_record(
     name: str,
     url: str = "",
     local_path: str = "",
+    vulnerability_analysis_enabled: bool = False,
     expected_generation: Optional[int] = None,
 ) -> Project:
     if _is_generation_cancelled(expected_generation):
@@ -2177,6 +2707,11 @@ def _create_project_record(
         final_path = local_path
         if not os.path.exists(final_path):
             raise ValueError(f"Local path does not exist: {final_path}")
+        if not _path_is_git_repository(final_path):
+            raise ValueError(
+                f"Local path is not a git repository: {final_path}. "
+                "Use a repository root, or use the import path scan to load all repositories inside a folder."
+            )
     elif url:
         repo_slug = _sanitize_repo_slug(url)
         folder_name = local_path.strip("/") if local_path else repo_slug
@@ -2191,6 +2726,7 @@ def _create_project_record(
         name=name,
         url=url,
         local_path=final_path,
+        vulnerability_analysis_enabled=bool(vulnerability_analysis_enabled),
         analysis_status="None",
     )
     if _is_generation_cancelled(expected_generation):
@@ -2213,11 +2749,52 @@ class BulkRepoItem(BaseModel):
     url: str
     name: Optional[str] = None
     local_path: Optional[str] = ""
+    vulnerability_analysis_enabled: bool = False
 
 
 class BulkCreateRequest(BaseModel):
     repositories: List[BulkRepoItem] = Field(default_factory=list)
     auto_analyze: bool = True
+
+
+def _expand_bulk_repo_items(items: List[BulkRepoItem]) -> List[BulkRepoItem]:
+    expanded: List[BulkRepoItem] = []
+    for item in items or []:
+        if not isinstance(item, BulkRepoItem):
+            continue
+        url = str(item.url or "").strip()
+        local_path = str(item.local_path or "").strip()
+        if url or not local_path or not os.path.isabs(local_path) or not os.path.exists(local_path):
+            expanded.append(item)
+            continue
+
+        discovered = _discover_git_repositories(local_path)
+        if not discovered:
+            expanded.append(item)
+            continue
+
+        original_norm = os.path.normcase(os.path.normpath(os.path.abspath(local_path)))
+        if len(discovered) == 1 and os.path.normcase(os.path.normpath(discovered[0])) == original_norm:
+            expanded.append(
+                BulkRepoItem(
+                    url="",
+                    name=item.name,
+                    local_path=discovered[0],
+                    vulnerability_analysis_enabled=bool(item.vulnerability_analysis_enabled),
+                )
+            )
+            continue
+
+        for repo_path in discovered:
+            expanded.append(
+                BulkRepoItem(
+                    url="",
+                    name=os.path.basename(repo_path.rstrip("\\/")) or None,
+                    local_path=repo_path,
+                    vulnerability_analysis_enabled=bool(item.vulnerability_analysis_enabled),
+                )
+            )
+    return expanded
 
 
 def _create_projects_from_items(
@@ -2227,6 +2804,9 @@ def _create_projects_from_items(
 ) -> Dict[str, Any]:
     if not items:
         raise HTTPException(status_code=400, detail="No repositories provided.")
+    items = _expand_bulk_repo_items(items)
+    if not items:
+        raise HTTPException(status_code=400, detail="No repositories found in the provided paths.")
 
     def worker(idx: int, item: BulkRepoItem) -> Dict[str, Any]:
         if _is_generation_cancelled(expected_generation):
@@ -2252,6 +2832,7 @@ def _create_projects_from_items(
                 name=name,
                 url=url,
                 local_path=local_path,
+                vulnerability_analysis_enabled=bool(item.vulnerability_analysis_enabled),
                 expected_generation=expected_generation,
             )
 
@@ -2335,9 +2916,14 @@ def _import_items_background(
 
 
 @app.post("/projects", response_model=Project)
-async def create_project(name: str, url: str = "", local_path: str = ""):
+async def create_project(name: str, url: str = "", local_path: str = "", vulnerability_analysis_enabled: bool = False):
     try:
-        return _create_project_record(name=name, url=url, local_path=local_path)
+        return _create_project_record(
+            name=name,
+            url=url,
+            local_path=local_path,
+            vulnerability_analysis_enabled=vulnerability_analysis_enabled,
+        )
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
@@ -2695,16 +3281,17 @@ async def create_projects_bulk(
     async_import: bool = False,
 ):
     generation = _get_workflow_generation()
+    expanded_items = _expand_bulk_repo_items(payload.repositories)
     if async_import:
-        background_tasks.add_task(_import_items_background, payload.repositories, payload.auto_analyze, generation)
+        background_tasks.add_task(_import_items_background, expanded_items, payload.auto_analyze, generation)
         return {
             "mode": "async",
             "message": "Bulk import started in background",
-            "requested": len(payload.repositories or []),
+            "requested": len(expanded_items or []),
             "auto_analyze": payload.auto_analyze,
         }
     return _create_projects_from_items(
-        payload.repositories,
+        expanded_items,
         payload.auto_analyze,
         expected_generation=generation,
     )
@@ -2715,6 +3302,7 @@ async def import_projects_csv(
     background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     auto_analyze: bool = Form(True),
+    vulnerability_analysis_enabled: bool = Form(False),
     async_import: bool = Form(True),
 ):
     filename = (file.filename or "").lower()
@@ -2758,11 +3346,19 @@ async def import_projects_csv(
         local_path = str(row.get(local_path_col, "") or "").strip() if local_path_col else ""
         if not url and not local_path:
             continue
-        items.append(BulkRepoItem(url=url, name=name or None, local_path=local_path))
+        items.append(
+            BulkRepoItem(
+                url=url,
+                name=name or None,
+                local_path=local_path,
+                vulnerability_analysis_enabled=bool(vulnerability_analysis_enabled),
+            )
+        )
 
     if not items:
         raise HTTPException(status_code=400, detail="No valid rows found in CSV.")
 
+    items = _expand_bulk_repo_items(items)
     generation = _get_workflow_generation()
     if async_import:
         background_tasks.add_task(_import_items_background, items, auto_analyze, generation)
@@ -2961,6 +3557,10 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         return
     history_repo_path: Optional[str] = None
     analysis_started_at = datetime.now()
+    topic_executor: Optional[ThreadPoolExecutor] = None
+    topic_future: Optional[Future] = None
+    analysis_progress_save_interval_sec = max(2.0, float(os.environ.get("ANALYSIS_PROGRESS_SAVE_INTERVAL_SEC", "12")))
+    last_analysis_progress_save_at = datetime.min
 
     try:
         if _is_generation_cancelled(expected_generation):
@@ -2989,6 +3589,7 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         email_to_dev_id = _build_email_to_dev_id(all_developers)
 
         _set_analysis_progress(project, 12.0, None, 0, 0)
+        base_window_months = 1
         project.ml_detection_status = "Running historical monthly analysis..."
         save_projects(projects_db)
 
@@ -2997,9 +3598,11 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         if not dpy_binary:
             print(
                 "DPy binary not found/executable. "
-                "Set DPY_BINARY to your Linux binary path or place it in RESOURCE_ROOT."
+                "Set DPY_BINARY to a binary compatible with your current OS "
+                "or place it in RESOURCE_ROOT."
             )
-        vuln_analyzer = BanditVulnerabilityAnalyzer()
+        vulnerabilities_enabled = _is_vulnerability_analysis_enabled(project)
+        vuln_analyzer = BanditVulnerabilityAnalyzer() if vulnerabilities_enabled else None
         ml_analyzer = MLSmellAnalyzer(os.path.join(RESOURCE_ROOT, "smell_ai"))
         sentiment_analyzer = DeveloperSentimentAnalyzer(os.path.join(RESOURCE_ROOT, "SE_Emotion_PTM-3589"))
 
@@ -3009,52 +3612,74 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         if not sentiment_ready and sentiment_analyzer.last_error:
             print(f"Developer sentiment disabled: {sentiment_analyzer.last_error}")
 
-        base_window_months = 1
         windows = _build_time_windows(commits, months_per_window=base_window_months)
         total_windows = len(windows)
         _set_analysis_progress(project, 18.0, _estimate_window_eta_seconds(project, datetime.now(), 0, total_windows), 0, total_windows)
         save_projects(projects_db)
         commits_sorted_asc = sorted(commits, key=lambda c: c.date)
+        github_http_cache: Dict[str, Any] = {}
         login_to_dev_id = _build_login_to_dev_id_map(all_developers)
-        login_to_dev_id = _augment_login_to_dev_id_map_with_github_contributors(project.url, all_developers, login_to_dev_id)
+        login_to_dev_id = _augment_login_to_dev_id_map_with_github_contributors(
+            project.url,
+            all_developers,
+            login_to_dev_id,
+            http_cache=github_http_cache,
+        )
         repo_web_base = _github_repo_web_base(project.url)
 
         project_start = windows[0]["start"] if windows else datetime.now()
         project_end = windows[-1]["end_exclusive"] if windows else _add_months(project_start, base_window_months)
         project.ml_detection_status = "Collecting PR/Issue communication..."
         save_projects(projects_db)
-        gh_interactions_all = _fetch_github_issue_pr_interactions(
+        gh_interactions_all, gh_text_signals_all = _fetch_github_issue_pr_data(
             project.url,
             project_start,
             project_end,
             login_to_dev_id,
-        )
-        gh_text_signals_all = _fetch_github_issue_pr_text_signals(
-            project.url,
-            project_start,
-            project_end,
-            login_to_dev_id,
+            http_cache=github_http_cache,
         )
 
-        cursor = 0
-        for w in windows:
-            end_exclusive = w["end_exclusive"]
-            while cursor < len(commits_sorted_asc) and commits_sorted_asc[cursor].date < end_exclusive:
-                cursor += 1
-            snapshot_commit = commits_sorted_asc[cursor - 1] if cursor > 0 else None
-            w["snapshot_commit_hash"] = snapshot_commit.hash if snapshot_commit else None
+        gh_interactions_all.sort(key=lambda x: x[2])
+        gh_text_signals_all.sort(key=lambda x: x.get("timestamp") or datetime.min)
 
+        window_commits_list: List[List[Commit]] = []
+        window_gh_interactions_list: List[List[Tuple[str, str, datetime]]] = []
+        window_gh_text_docs_list: List[List[Dict[str, Any]]] = []
         window_activity_ids: List[set] = []
         all_known_dev_ids: set = {d.id for d in all_developers if d.id}
+
+        commit_cursor = 0
+        interaction_cursor = 0
+        signal_cursor = 0
         for w in windows:
-            start = w["start"]
             end_exclusive = w["end_exclusive"]
-            commit_authors = {c.author_id for c in commits_sorted_asc if c.author_id and start <= c.date < end_exclusive}
+
+            commit_start = commit_cursor
+            while commit_cursor < len(commits_sorted_asc) and commits_sorted_asc[commit_cursor].date < end_exclusive:
+                commit_cursor += 1
+            snapshot_commit = commits_sorted_asc[commit_cursor - 1] if commit_cursor > 0 else None
+            w["snapshot_commit_hash"] = snapshot_commit.hash if snapshot_commit else None
+            window_commits = commits_sorted_asc[commit_start:commit_cursor]
+            window_commits_list.append(window_commits)
+
+            interaction_start = interaction_cursor
+            while interaction_cursor < len(gh_interactions_all) and gh_interactions_all[interaction_cursor][2] < end_exclusive:
+                interaction_cursor += 1
+            window_interactions = gh_interactions_all[interaction_start:interaction_cursor]
+            window_gh_interactions_list.append(window_interactions)
+
+            signal_start = signal_cursor
+            while signal_cursor < len(gh_text_signals_all) and gh_text_signals_all[signal_cursor].get("timestamp") < end_exclusive:
+                signal_cursor += 1
+            window_text_docs = gh_text_signals_all[signal_start:signal_cursor]
+            window_gh_text_docs_list.append(window_text_docs)
+
+            commit_authors = {c.author_id for c in window_commits if c.author_id}
             comm_participants = {
                 actor_id
-                for (src, dst, ts) in gh_interactions_all
+                for (src, dst, _) in window_interactions
                 for actor_id in (src, dst)
-                if actor_id and start <= ts < end_exclusive
+                if actor_id
             }
             active_ids = set(commit_authors) | set(comm_participants)
             window_activity_ids.append(active_ids)
@@ -3073,7 +3698,35 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         windows_started_at = datetime.now()
         latest_commit_by_dev: Dict[str, Commit] = {}
         interaction_documents: List[Dict[str, Any]] = []
+        topic_analyzer = RoleTopicModelingAnalyzer(config=_effective_llm_config())
+        topic_prepared_accumulator = topic_analyzer.prepare_documents_incremental()
         checkpoint_partial_results = project.last_analyzed is None
+
+        def _save_analysis_progress_state(force: bool = False) -> None:
+            nonlocal last_analysis_progress_save_at
+            now = datetime.now()
+            if not force and (now - last_analysis_progress_save_at).total_seconds() < analysis_progress_save_interval_sec:
+                return
+            save_projects(projects_db)
+            last_analysis_progress_save_at = now
+
+        def _register_interaction_document(doc: Optional[Dict[str, Any]]) -> None:
+            if not doc:
+                return
+            interaction_documents.append(doc)
+            topic_analyzer.add_document_to_prepared(topic_prepared_accumulator, doc)
+
+        def _ensure_topic_analysis_started() -> None:
+            nonlocal topic_executor, topic_future
+            if topic_future is not None:
+                return
+            prepared_documents = topic_analyzer.finalize_prepared_documents(topic_prepared_accumulator)
+            topic_executor = ThreadPoolExecutor(max_workers=1)
+            topic_future = topic_executor.submit(
+                topic_analyzer.analyze_prepared_documents,
+                prepared_documents,
+                project.name,
+            )
 
         # R-SZZ is expensive: compute bug-inducing commits once, then assign each
         # event to its corresponding historical window.
@@ -3087,8 +3740,50 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         bic_events.sort(key=lambda x: x[0])
         bic_cursor = 0
 
-        history_repo_path = _clone_repo_for_history(project.local_path)
+        # Phase 1: Parallel Bulk Analysis of Snapshots
+        unique_hashes = sorted(list({str(w.get("snapshot_commit_hash")) for w in windows if w.get("snapshot_commit_hash")}))
+        to_analyze = [h for h in unique_hashes if h not in snapshot_cache]
+        
+        if to_analyze:
+            project.ml_detection_status = f"Parallel Analysis: {len(to_analyze)} snapshots..."
+            _save_analysis_progress_state(force=True)
+            
+            max_workers = int(os.environ.get("SMELLHUB_MAX_WORKERS", str(max(1, (os.cpu_count() or 2) // 2))))
+            worker_args = [
+                (h, project.local_path, dpy_binary, os.path.join(RESOURCE_ROOT, "smell_ai"), vulnerabilities_enabled, email_to_dev_id, base_dev_by_id)
+                for h in to_analyze
+            ]
+            
+            with ProcessPoolExecutor(max_workers=max_workers) as pool:
+                futures = [pool.submit(_analyze_snapshot_worker, arg) for arg in worker_args]
+                completed_count = 0
+                for fut in as_completed(futures):
+                    if _is_generation_cancelled(expected_generation):
+                        raise AnalysisCancelled("Analysis cancelled.")
+                    
+                    try:
+                        res = fut.result()
+                    except Exception as e:
+                        res = {"error": str(e)}
 
+                    if "error" in res:
+                        print(f"Worker process error: {res['error']}")
+                    else:
+                        target_hash = res["snapshot_hash"]
+                        snapshot_cache[target_hash] = res
+                    
+                    completed_count += 1
+                    project.ml_detection_status = f"Parallel Analysis: {completed_count}/{len(to_analyze)} snapshots..."
+                    _set_analysis_progress(
+                        project,
+                        20.0 + (50.0 * (float(completed_count) / float(len(to_analyze)))),
+                        None,
+                        completed_count,
+                        len(to_analyze)
+                    )
+                    _save_analysis_progress_state()
+
+        # Phase 2: Sequential aggregation
         for idx, w in enumerate(windows):
             if _is_generation_cancelled(expected_generation):
                 raise AnalysisCancelled("Analysis cancelled by Delete All Projects.")
@@ -3096,7 +3791,9 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
             end_exclusive = w["end_exclusive"]
             is_latest_window = idx == (len(windows) - 1)
             snapshot_hash = str(w.get("snapshot_commit_hash") or "")
-            window_commits = [c for c in commits_sorted_asc if start <= c.date < end_exclusive]
+            window_commits = window_commits_list[idx]
+            window_gh_interactions = window_gh_interactions_list[idx]
+            window_gh_text_docs = window_gh_text_docs_list[idx]
             window_latest_commit_by_dev: Dict[str, Commit] = {}
             for c in window_commits:
                 if not c.author_id:
@@ -3105,73 +3802,23 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
                 if prev_commit is None or c.date > prev_commit.date:
                     window_latest_commit_by_dev[c.author_id] = c
             latest_commit_by_dev.update(window_latest_commit_by_dev)
+            
             snapshot_result: Dict[str, Any]
-
             if snapshot_hash:
                 cached = snapshot_cache.get(snapshot_hash)
                 if cached is None:
-                    _checkout_ref(history_repo_path, snapshot_hash)
-                    processed_windows = idx
-                    eta_seconds = _estimate_window_eta_seconds(project, windows_started_at, processed_windows, total_windows)
-                    _set_analysis_progress(
-                        project,
-                        20.0 + (70.0 * (float(processed_windows) / float(max(total_windows, 1)))),
-                        eta_seconds,
-                        processed_windows,
-                        total_windows,
-                    )
-                    project.ml_detection_status = f"Analyzing {w['label']} ({idx + 1}/{len(windows)})"
-                    save_projects(projects_db)
-
-                    snap_ml = ml_analyzer.analyze_directory(history_repo_path, None)
-                    snap_traditional = traditional_analyzer.analyze_directory(history_repo_path, email_to_dev_id)
-                    if traditional_analyzer.last_error:
-                        print(
-                            f"DPy warning ({w['label']}): "
-                            f"{traditional_analyzer.last_status} - {traditional_analyzer.last_error}"
-                        )
-                    snap_vulnerabilities = vuln_analyzer.analyze_directory(history_repo_path, email_to_dev_id)
-
-                    ml_enriched = _attribute_instances_to_developers(
-                        snap_ml, history_repo_path, email_to_dev_id, base_dev_by_id
-                    )
-                    traditional_enriched = _attribute_instances_to_developers(
-                        snap_traditional, history_repo_path, email_to_dev_id, base_dev_by_id
-                    )
-                    vulnerabilities_enriched = _attribute_instances_to_developers(
-                        snap_vulnerabilities, history_repo_path, email_to_dev_id, base_dev_by_id
-                    )
-
-                    loc_est, nom_est = _compute_loc_nom_for_snapshot(history_repo_path)
-
-                    cached = {
-                        "ml_enriched": ml_enriched,
-                        "traditional_enriched": traditional_enriched,
-                        "vulnerabilities_enriched": vulnerabilities_enriched,
-                        "loc": loc_est,
-                        "nom": nom_est,
-                        "ml_status": ml_analyzer.last_status,
-                        "ml_error": ml_analyzer.last_error,
-                        "ml_stdout": (ml_analyzer.last_stdout or "")[:4000] or None,
-                        "ml_stderr": (ml_analyzer.last_stderr or "")[:4000] or None,
-                        "ml_call_graph_nodes": ml_analyzer.last_call_graph_nodes,
-                        "ml_call_graph_edges": ml_analyzer.last_call_graph_edges,
+                    snapshot_result = {
+                        "ml_enriched": [], "traditional_enriched": [], "vulnerabilities_enriched": [],
+                        "loc": 0, "nom": 0, "ml_status": "Parallel Failure", "ml_error": None,
+                        "ml_stdout": None, "ml_stderr": None, "ml_call_graph_nodes": [], "ml_call_graph_edges": [],
                     }
-                    snapshot_cache[snapshot_hash] = cached
-                snapshot_result = cached
+                else:
+                    snapshot_result = cached
             else:
                 snapshot_result = {
-                    "ml_enriched": [],
-                    "traditional_enriched": [],
-                    "vulnerabilities_enriched": [],
-                    "loc": 0,
-                    "nom": 0,
-                    "ml_status": "No commits available",
-                    "ml_error": None,
-                    "ml_stdout": None,
-                    "ml_stderr": None,
-                    "ml_call_graph_nodes": [],
-                    "ml_call_graph_edges": [],
+                    "ml_enriched": [], "traditional_enriched": [], "vulnerabilities_enriched": [],
+                    "loc": 0, "nom": 0, "ml_status": "No commits", "ml_error": None,
+                    "ml_stdout": None, "ml_stderr": None, "ml_call_graph_nodes": [], "ml_call_graph_edges": [],
                 }
 
             if is_latest_window:
@@ -3218,16 +3865,11 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
                 bic_cursor += 1
 
             window_gh_text_by_dev: Dict[str, List[str]] = {}
-            window_gh_text_docs: List[Dict[str, Any]] = []
-            for signal in gh_text_signals_all:
-                if not isinstance(signal, dict):
-                    continue
+            for signal in window_gh_text_docs:
                 dev_id = str(signal.get("developer_id") or "").strip()
-                ts = signal.get("timestamp")
                 txt = str(signal.get("text") or "").strip()
-                if dev_id and txt and isinstance(ts, datetime) and start <= ts < end_exclusive:
+                if dev_id and txt:
                     window_gh_text_by_dev.setdefault(dev_id, []).append(txt)
-                    window_gh_text_docs.append(signal)
 
             classifier.classify_developers(
                 window_developers,
@@ -3241,10 +3883,6 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
 
             nb = NetworkBuilder()
             nb.build_collaboration_network(window_commits)
-            window_gh_interactions = [
-                x for x in gh_interactions_all
-                if start <= x[2] < end_exclusive
-            ]
             if window_gh_interactions:
                 nb.communication_source = "github_pr_issue"
                 nb.build_communication_network(window_gh_interactions)
@@ -3294,7 +3932,7 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
                     thread_is_open=False,
                 )
                 if doc:
-                    interaction_documents.append(doc)
+                    _register_interaction_document(doc)
 
             for signal in window_gh_text_docs:
                 dev_id = str(signal.get("developer_id") or "").strip()
@@ -3319,7 +3957,12 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
                     thread_is_open=bool(signal.get("thread_is_open")),
                 )
                 if doc:
-                    interaction_documents.append(doc)
+                    _register_interaction_document(doc)
+
+            if is_latest_window:
+                project.ml_detection_status = "Extracting role topics..."
+                save_projects(projects_db)
+                _ensure_topic_analysis_started()
 
             for s in community_smells:
                 for entity_id in s.affected_entities:
@@ -3509,7 +4152,7 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
                     project.metrics = []
                     project.collaboration_edges = []
                 _save_topic_documents(project.id, interaction_documents)
-            save_projects(projects_db)
+            _save_analysis_progress_state(force=is_latest_window)
 
         if _is_generation_cancelled(expected_generation):
             raise AnalysisCancelled("Analysis cancelled by Delete All Projects.")
@@ -3531,8 +4174,8 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         try:
             project.ml_detection_status = "Extracting role topics..."
             save_projects(projects_db)
-            topic_analyzer = RoleTopicModelingAnalyzer(config=_effective_llm_config())
-            project.topic_modeling = topic_analyzer.analyze_documents(interaction_documents, scope_label=project.name)
+            _ensure_topic_analysis_started()
+            project.topic_modeling = topic_future.result() if topic_future is not None else topic_analyzer.analyze_documents(interaction_documents, scope_label=project.name)
         except Exception as e:
             project.topic_modeling = TopicModelingResult(
                 status="Error",
@@ -3575,6 +4218,8 @@ def run_full_analysis(project_id: str, expected_generation: Optional[int] = None
         _set_analysis_progress(project, 0.0, None, 0, int(project.analysis_window_total or 0))
         save_projects(projects_db)
     finally:
+        if topic_executor is not None:
+            topic_executor.shutdown(wait=False, cancel_futures=False)
         if history_repo_path and os.path.exists(history_repo_path):
             shutil.rmtree(history_repo_path, ignore_errors=True)
 

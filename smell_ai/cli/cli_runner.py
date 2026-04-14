@@ -45,6 +45,7 @@ class CodeSmileCLI:
         print(f"Resume execution: {self.args.resume}")
         print(f"Max Walkers: {self.args.max_walkers}")
         print(f"Analyze multiple projects: {self.args.multiple}")
+        call_graph_enabled = getattr(self.args, "call_graph", False)
 
         if not self.args.resume:
             self.analyzer.clean_output_directory()
@@ -54,17 +55,19 @@ class CodeSmileCLI:
                 self.analyzer.analyze_projects_parallel(
                     self.args.input,
                     self.args.max_walkers,
-                    generate_graph=self.args.call_graph,
+                    generate_graph=call_graph_enabled,
                 )
             else:
                 self.analyzer.analyze_projects_sequential(
                     self.args.input,
                     resume=self.args.resume,
-                    generate_graph=self.args.call_graph,
+                    generate_graph=call_graph_enabled,
                 )
         else:
             total_smells = self.analyzer.analyze_project(
-                self.args.input, generate_graph=self.args.call_graph
+                self.args.input,
+                generate_graph=call_graph_enabled,
+                max_workers=self.args.max_walkers if self.args.parallel else 1,
             )
             print(
                 f"Analysis completed. Total code smells found: {total_smells}"

@@ -40,10 +40,18 @@ class TraditionalSmellAnalyzer:
             "-L", f"{line},{line}", rel_file
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
         except Exception:
             return None
-        for raw in res.stdout.splitlines():
+        stdout = res.stdout or ""
+        for raw in stdout.splitlines():
             if raw.startswith("author-mail "):
                 email = raw.split(" ", 1)[1].strip()
                 email = email.strip("<>").lower()
@@ -58,7 +66,15 @@ class TraditionalSmellAnalyzer:
             "-f", "json",
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+                timeout=120,
+            )
             log_text = f"{res.stdout}\n{res.stderr}".lower()
             self.last_status = "DPy executed"
             self.last_error = None
@@ -131,12 +147,12 @@ class TraditionalSmellAnalyzer:
             self.last_status = "DPy binary not found"
             self.last_error = f"Missing file: {self.dpy_binary}"
             return []
-        if not os.access(self.dpy_binary, os.X_OK):
+        if os.name != "nt" and not os.access(self.dpy_binary, os.X_OK):
             self.last_status = "DPy binary not executable"
             self.last_error = f"Permission denied (not executable): {self.dpy_binary}"
             return []
 
-        with tempfile.TemporaryDirectory(prefix="dpy_", dir="/tmp") as out_dir:
+        with tempfile.TemporaryDirectory(prefix="dpy_") as out_dir:
             ok, log_text = self._run_dpy(project_root, out_dir)
             if not ok:
                 return []
@@ -163,7 +179,7 @@ class TraditionalSmellAnalyzer:
                     candidates.append(sub_path)
 
                 for sub_path in candidates[:max_shards]:
-                    with tempfile.TemporaryDirectory(prefix="dpy_shard_", dir="/tmp") as shard_out:
+                    with tempfile.TemporaryDirectory(prefix="dpy_shard_") as shard_out:
                         shard_ok, _ = self._run_dpy(sub_path, shard_out)
                         if not shard_ok:
                             continue

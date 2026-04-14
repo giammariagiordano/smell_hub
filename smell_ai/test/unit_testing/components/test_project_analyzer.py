@@ -225,9 +225,17 @@ def test_analyze_projects_parallel(
         lambda path: True,  # Mock that all paths are directories
     )
 
-    # Mock the inspector's inspect method
-    project_analyzer.inspector.inspect = MagicMock(
-        return_value=mock_inspection_results
+    build_mock = MagicMock()
+
+    def build_mock_inspector():
+        inspector = MagicMock()
+        inspector.inspect.return_value = mock_inspection_results
+        return inspector
+
+    build_mock.side_effect = build_mock_inspector
+    monkeypatch.setattr(
+        "components.project_analyzer.ProjectAnalyzer._build_inspector",
+        lambda self: build_mock(),
     )
 
     # Mock save results method
@@ -252,9 +260,8 @@ def test_analyze_projects_parallel(
                 "test/unit_testing/components/mock_base_path", max_workers=1
             )
 
-        # Ensure the inspector's inspect method
-        # was called the expected number of times
-        assert project_analyzer.inspector.inspect.call_count == 2
+        # Ensure worker-local inspectors were created and used
+        assert build_mock.call_count >= 1
 
         # Check if print statements were made (optional)
         assert mock_print.call_count > 0
@@ -493,4 +500,42 @@ def test_analyze_project_with_graph_generation(
         
         # Verify build_graph was called
         MockBuilder.return_value.build_graph.assert_called_once()
+
+
+def test_analyze_project_parallel_single_repo(
+    monkeypatch, project_analyzer, tmp_path
+):
+    monkeypatch.setattr(
+        "utils.file_utils.FileUtils.get_python_files",
+        lambda _: ["file1.py", "file2.py", "file3.py"],
+    )
+    monkeypatch.setattr(
+        "components.project_analyzer.ProjectAnalyzer._save_results",
+        lambda self, df, path: None,
+    )
+
+    def build_mock_inspector():
+        inspector = MagicMock()
+        inspector.inspect.side_effect = lambda filename: pd.DataFrame(
+            {
+                "filename": [filename],
+                "function_name": ["func"],
+                "smell_name": ["smell"],
+                "line": [1],
+                "description": ["desc"],
+                "additional_info": ["info"],
+            }
+        )
+        return inspector
+
+    monkeypatch.setattr(
+        "components.project_analyzer.ProjectAnalyzer._build_inspector",
+        lambda self: build_mock_inspector(),
+    )
+
+    total_smells = project_analyzer.analyze_project(
+        "dummy_project", max_workers=3
+    )
+
+    assert total_smells == 3
 

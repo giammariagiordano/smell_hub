@@ -21,8 +21,8 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print("device:", device)
 
 def load_data(train_file, test_file):
-    train_df = pd.read_csv(train_file)
-    val_df = pd.read_csv(test_file)
+    train_df = pd.read_csv(train_file, encoding='utf-8')
+    val_df = pd.read_csv(test_file, encoding='utf-8')
     return train_df, val_df
 
 def load_model(model_path):
@@ -189,7 +189,7 @@ def train_model(model, tokenizer, train_dataloader, epochs, delta, optimizer, sc
             my_array_pred = np.array(pred_flat)
             my_array_true = np.array(true_labels)
             df = pd.DataFrame({'Pred': my_array_pred, 'True': my_array_true})
-            df.to_csv(output_file, index=False)
+            df.to_csv(output_file, index=False, encoding='utf-8')
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Emotion Classification.")

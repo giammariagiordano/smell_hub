@@ -1,6 +1,8 @@
 import os
 import re
-from typing import List, Dict, Set
+import uuid
+import subprocess
+from typing import List, Dict, Set, Optional
 from git import Repo
 from datetime import datetime
 from models.schemas import Commit, Developer
@@ -13,49 +15,101 @@ class RepositoryMiner:
         self.person_id_map: Dict[str, str] = {}  # email -> person_id
 
     def list_commits(self, since: datetime = None, until: datetime = None) -> List[Commit]:
-        commits = []
-        kwargs = {'rev': 'HEAD'}
+        cmd = [
+            "git", "-C", self.repo_path, "log",
+            "--numstat",
+            "--format=COMMIT:%H|%ae|%an|%at|%P|%B%x00"
+        ]
         if since:
-            kwargs['since'] = since
+            cmd.append(f"--since={since.isoformat()}")
         if until:
-            kwargs['until'] = until
-            
-        for git_commit in self.repo.iter_commits(**kwargs):
-            author_email = git_commit.author.email
-            author_name = git_commit.author.name
-            tz_offset_minutes = None
+            cmd.append(f"--until={until.isoformat()}")
+        
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True
+            )
+        except Exception as e:
+            print(f"Error running git log: {e}")
+            return []
+
+        commits = []
+        raw_output = result.stdout
+        # Split by the "COMMIT:" marker followed by the hash format
+        raw_chunks = raw_output.split("COMMIT:")[1:]
+        
+        for chunk in raw_chunks:
+            # The chunk starts with hash|email|name|timestamp|parents|message\0
+            # followed by the numstat lines
             try:
-                authored_dt = git_commit.authored_datetime
-                if authored_dt and authored_dt.utcoffset() is not None:
-                    tz_offset_minutes = int(authored_dt.utcoffset().total_seconds() // 60)
-            except Exception:
-                tz_offset_minutes = None
+                header_part, numstat_part = chunk.split("\x00", 1)
+            except ValueError:
+                header_part = chunk
+                numstat_part = ""
             
-            # Basic Identity Matching
-            person_id = self._get_person_id(author_name, author_email)
+            parts = header_part.split("|", 5)
+            if len(parts) < 6:
+                continue
             
-            # Identify Bug Fixes (Basic heuristic)
+            commit_hash = parts[0]
+            author_email = parts[1]
+            author_name = parts[2]
+            try:
+                commit_timestamp = int(parts[3])
+                commit_date = datetime.fromtimestamp(commit_timestamp)
+            except ValueError:
+                commit_date = datetime.now()
+            
+            # parts[4] is parents, parts[5] is message
+            message = parts[5].strip()
+            
+            # Identify Bug Fixes
             is_bug_fix = False
             bug_id = None
-            msg = git_commit.message.lower()
-            if any(k in msg for k in ["fix", "bug", "error", "issue", "resolve"]):
+            msg_lower = message.lower()
+            if any(k in msg_lower for k in ["fix", "bug", "error", "issue", "resolve"]):
                 is_bug_fix = True
-                # Try to extract bug ID
-                match = re.search(r'#(\d+)', msg)
+                match = re.search(r'#(\d+)', msg_lower)
                 if match:
                     bug_id = match.group(1)
 
-            files = list(git_commit.stats.files.keys())
-            lines_added = int(git_commit.stats.total.get('insertions', 0))
-            lines_deleted = int(git_commit.stats.total.get('deletions', 0))
+            # Parse numstat
+            files_modified = []
+            lines_added = 0
+            lines_deleted = 0
+            
+            for line in numstat_part.strip().splitlines():
+                line = line.strip()
+                if not line:
+                    continue
+                num_parts = line.split(None, 2)
+                if len(num_parts) < 3:
+                    continue
+                try:
+                    add = int(num_parts[0]) if num_parts[0] != '-' else 0
+                    dele = int(num_parts[1]) if num_parts[1] != '-' else 0
+                    file_path = num_parts[2]
+                    
+                    lines_added += add
+                    lines_deleted += dele
+                    files_modified.append(file_path)
+                except ValueError:
+                    continue
+
+            person_id = self._get_person_id(author_name, author_email)
             
             commits.append(Commit(
-                hash=git_commit.hexsha,
+                hash=commit_hash,
                 author_id=person_id,
-                date=datetime.fromtimestamp(git_commit.committed_date),
-                tz_offset_minutes=tz_offset_minutes,
-                message=git_commit.message,
-                files_modified=files,
+                date=commit_date,
+                tz_offset_minutes=None, # git log %at gives UTC timestamp
+                message=message,
+                files_modified=files_modified,
                 is_bug_fix=is_bug_fix,
                 bug_id=bug_id,
                 lines_added=lines_added,

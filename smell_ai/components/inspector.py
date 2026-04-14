@@ -53,16 +53,24 @@ class Inspector:
             "description",
             "additional_info",
         ]
-        to_save = pd.DataFrame(columns=col)
+        all_detected_smells = []
         file_path = os.path.abspath(filename)
 
         try:
             with open(file_path, "r", encoding="utf-8") as file:
-                source = file.read()
+                source = file.read() or ""
 
             # Parse the file into an AST
             tree = ast.parse(source)
             lines = source.splitlines()
+            function_nodes = [
+                node for node in ast.walk(tree) if isinstance(node, ast.FunctionDef)
+            ]
+            line_map = {
+                node.lineno: lines[node.lineno - 1]
+                for node in ast.walk(tree)
+                if hasattr(node, "lineno") and 0 < node.lineno <= len(lines)
+            }
 
             # Step 1: Extract Libraries
             libraries = self.library_extractor.get_library_aliases(
@@ -72,62 +80,54 @@ class Inspector:
             # Step 2: Analyze Functions and Extract Variables
             variables_by_function = {}
             dataframe_variables_by_function = {}
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef):
-                    function_name = node.name
-                    variables_by_function[function_name] = (
-                        self.variable_extractor.extract_variable_definitions(
-                            node
-                        )
+            pandas_alias = libraries.get("pandas", None)
+            for node in function_nodes:
+                function_name = node.name
+                variables_by_function[function_name] = (
+                    self.variable_extractor.extract_variable_definitions(node)
+                )
+                dataframe_variables_by_function[function_name] = (
+                    self.dataframe_extractor.extract_dataframe_variables(
+                        node, alias=pandas_alias
                     )
-                    dataframe_variables_by_function[function_name] = (
-                        self.dataframe_extractor.extract_dataframe_variables(
-                            node, alias=libraries.get("pandas", None)
-                        )
-                    )
+                )
 
             # Step 3: Load Dictionaries (preloaded during setup)
-            models = self.model_extractor.model_dict
-            tensor_operations = self.model_extractor.tensor_operations_dict
+            models = dict(self.model_extractor.model_dict or {})
+            tensor_operations = self.model_extractor.tensor_operations_dict or {}
             dataframe_methods = self.dataframe_extractor.df_methods
+            model_methods = self.model_extractor.load_model_methods()
+            common_function_data = {
+                "libraries": libraries,
+                "lines": line_map,
+                "dataframe_methods": dataframe_methods,
+                "tensor_operations": tensor_operations.get("operation", []),
+                "models": models,
+                "model_methods": model_methods,
+            }
 
             # Step 4: Rule Check on Each Function
-            for node in ast.walk(tree):
-                if isinstance(node, ast.FunctionDef):
-                    try:
-                        function_data = {
-                            "libraries": libraries,
-                            "variables": variables_by_function[node.name],
-                            "lines": {
-                                n.lineno: lines[n.lineno - 1]
-                                for n in ast.walk(tree)
-                                if hasattr(n, "lineno")
-                            },
-                            "dataframe_methods": dataframe_methods,
-                            "dataframe_variables": (
-                                dataframe_variables_by_function[node.name]
-                            ),
-                            "tensor_operations": tensor_operations.get(
-                                "operation", []
-                            ),
-                            "models": {
-                                model: models[model] for model in models.keys()
-                            },
-                            "model_methods": (
-                                self.model_extractor.load_model_methods()
-                            ),
-                        }
+            for node in function_nodes:
+                try:
+                    function_data = {
+                        **common_function_data,
+                        "variables": variables_by_function[node.name],
+                        "dataframe_variables": (
+                            dataframe_variables_by_function[node.name]
+                        ),
+                    }
 
-                        # Pass data to the Rule Checker
-                        to_save = self.rule_checker.rule_check(
-                            node, function_data, filename, node.name, to_save
-                        )
-                    except Exception as e:
-                        print(
-                            f"Error processing function '{node.name}' in file "
-                            f"'{filename}': {e}"
-                        )
-                        raise e
+                    # Pass data to the Rule Checker
+                    detected = self.rule_checker.rule_check(
+                        node, function_data, filename, node.name
+                    )
+                    all_detected_smells.extend(detected)
+                except Exception as e:
+                    print(
+                        f"Error processing function '{node.name}' in file "
+                        f"'{filename}': {e}"
+                    )
+                    raise e
 
         except FileNotFoundError as e:
             print(f"Error: File '{filename}' not found. {e}")
@@ -139,6 +139,7 @@ class Inspector:
             print(f"Unexpected error while analyzing file '{filename}': {e}")
             raise e
 
+        to_save = pd.DataFrame(all_detected_smells, columns=col)
         return to_save
 
     def _setup(

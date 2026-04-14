@@ -166,6 +166,7 @@ const timeWindowLabel = document.getElementById('timeWindowLabel');
 const prevWindowBtn = document.getElementById('prevWindowBtn');
 const nextWindowBtn = document.getElementById('nextWindowBtn');
 const analysisEta = document.getElementById('analysisEta');
+const vulnerabilityScanStatus = document.getElementById('vulnerabilityScanStatus');
 const snapshotTabBtn = document.getElementById('snapshotTabBtn');
 const overallTabBtn = document.getElementById('overallTabBtn');
 const snapshotTabPanel = document.getElementById('snapshotTabPanel');
@@ -201,6 +202,7 @@ const nextRepoInListBtn = document.getElementById('nextRepoInListBtn');
 const repoListPositionLabel = document.getElementById('repoListPositionLabel');
 const repoListCurrentValue = document.getElementById('repoListCurrentValue');
 const projCsvFileInput = document.getElementById('projCsvFile');
+const projEnableVulnerabilitiesInput = document.getElementById('projEnableVulnerabilities');
 const importCsvBtn = document.getElementById('importCsvBtn');
 const importCsvAnalyzeBtn = document.getElementById('importCsvAnalyzeBtn');
 const addProjectAnalyzeBtn = document.getElementById('addProjectAnalyzeBtn');
@@ -2587,6 +2589,7 @@ addProjectBtn.onclick = () => {
     document.getElementById('projUrls').value = '';
     document.getElementById('projPath').value = '';
     if (projCsvFileInput) projCsvFileInput.value = '';
+    if (projEnableVulnerabilitiesInput) projEnableVulnerabilitiesInput.checked = false;
     setBulkImportStatus('');
     addRepoPreviewIndex = 0;
     renderRepoListPreview();
@@ -2615,6 +2618,7 @@ if (nextRepoInListBtn) {
 }
 async function runCsvImport(autoAnalyze = false) {
     const file = projCsvFileInput?.files?.[0];
+    const vulnerabilityAnalysisEnabled = Boolean(projEnableVulnerabilitiesInput?.checked);
     if (!file) {
         alert('Please select a CSV file first.');
         return;
@@ -2645,6 +2649,7 @@ async function runCsvImport(autoAnalyze = false) {
     const formData = new FormData();
     formData.append('file', file);
     formData.append('auto_analyze', autoAnalyze ? 'true' : 'false');
+    formData.append('vulnerability_analysis_enabled', vulnerabilityAnalysisEnabled ? 'true' : 'false');
     formData.append('async_import', 'true');
 
     try {
@@ -2734,18 +2739,80 @@ async function runAddProjects(autoAnalyze = false) {
     const name = document.getElementById('projName').value.trim();
     const urlsRaw = document.getElementById('projUrls').value;
     const path = document.getElementById('projPath').value.trim();
+    const vulnerabilityAnalysisEnabled = Boolean(projEnableVulnerabilitiesInput?.checked);
     const urls = parseRepoUrlList(urlsRaw);
     const submitBtn = ensureAddAnalyzeBtn();
     const addOnlyBtn = ensureAddProjectBtnModal();
 
-    if (!urls.length) {
-        alert('Please provide at least one repository URL.');
+    if (!urls.length && !path) {
+        alert('Please provide at least one repository URL or an absolute local path.');
         return;
     }
 
     if (urls.length > 1 && path) {
         alert('Local path can be used only when adding a single repository.');
         return;
+    }
+
+    if (!urls.length && path) {
+        try {
+            if (addOnlyBtn) {
+                addOnlyBtn.disabled = true;
+                addOnlyBtn.innerText = 'Adding...';
+            }
+            if (submitBtn) {
+                submitBtn.disabled = true;
+                submitBtn.innerText = 'Adding...';
+            }
+            setBulkImportStatus(autoAnalyze ? 'Scanning local path and starting full analysis...' : 'Scanning local path...');
+
+            const repositories = [{
+                url: '',
+                name: name || '',
+                local_path: path,
+                vulnerability_analysis_enabled: vulnerabilityAnalysisEnabled,
+            }];
+            const res = await fetch(`${API_URL}/projects/bulk?async_import=true`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ repositories, auto_analyze: autoAnalyze }),
+            });
+            const body = await res.json();
+            if (!res.ok) {
+                alert(body?.detail || 'Failed to import repositories from path.');
+                return;
+            }
+
+            if (body?.mode === 'async') {
+                setBulkImportStatus(
+                    autoAnalyze
+                        ? 'Path import queued. All Git repositories inside that folder will be imported and analyzed in background.'
+                        : 'Path import queued. All Git repositories inside that folder will be imported in background.'
+                );
+                addProjectModal.classList.add('hidden');
+                fetchProjects();
+                return;
+            }
+
+            setBulkImportStatus(autoAnalyze ? 'Repositories discovered from path. Full analysis started.' : 'Repositories discovered from path.');
+            addProjectModal.classList.add('hidden');
+            fetchProjects();
+            return;
+        } catch (err) {
+            console.error('Path import failed', err);
+            alert('Backend not reachable on http://127.0.0.1:8001. Start the server and try again.');
+            setBulkImportStatus('Backend not reachable on http://127.0.0.1:8001.', true);
+            return;
+        } finally {
+            if (addOnlyBtn) {
+                addOnlyBtn.disabled = false;
+                addOnlyBtn.innerText = 'Add Project';
+            }
+            if (submitBtn) {
+                submitBtn.disabled = false;
+                submitBtn.innerText = 'Add & Full Analysis';
+            }
+        }
     }
 
     if (urls.length === 1) {
@@ -2763,7 +2830,12 @@ async function runAddProjects(autoAnalyze = false) {
             const url = urls[0];
             const inferredName = url.replace(/\/+$/, '').split('/').pop()?.replace(/\.git$/, '') || 'repository';
             const projectName = name || inferredName;
-            const repositories = [{ url, name: projectName, local_path: path || '' }];
+            const repositories = [{
+                url,
+                name: projectName,
+                local_path: path || '',
+                vulnerability_analysis_enabled: vulnerabilityAnalysisEnabled,
+            }];
             const res = await fetch(`${API_URL}/projects/bulk?async_import=true`, {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -2821,7 +2893,11 @@ async function runAddProjects(autoAnalyze = false) {
         const repositories = urls.map((url, idx) => {
             const inferred = url.replace(/\/+$/, '').split('/').pop()?.replace(/\.git$/, '') || `repository-${idx + 1}`;
             const itemName = name ? `${name} ${idx + 1}` : inferred;
-            return { url, name: itemName };
+            return {
+                url,
+                name: itemName,
+                vulnerability_analysis_enabled: vulnerabilityAnalysisEnabled,
+            };
         });
 
         const res = await fetch(`${API_URL}/projects/bulk?async_import=true`, {
@@ -2959,6 +3035,25 @@ timeWindowSelect.onchange = (e) => {
 // Polling
 let pollInterval = null;
 
+function topicModelSignature(project) {
+    const result = project?.topic_modeling || null;
+    if (!result || typeof result !== 'object') return 'none';
+    const roles = Array.isArray(result.roles) ? result.roles.length : 0;
+    const developers = Array.isArray(result.developers) ? result.developers.length : 0;
+    const conflicts = Array.isArray(result.conflicts) ? result.conflicts.length : 0;
+    const potential = Array.isArray(result.potential_conflict_threads) ? result.potential_conflict_threads.length : 0;
+    return [
+        String(result.status || ''),
+        String(result.generated_at || ''),
+        Number(result.source_count || 0),
+        roles,
+        developers,
+        conflicts,
+        potential,
+        String(result.error || ''),
+    ].join('|');
+}
+
 async function fetchProjects() {
     try {
         const res = await fetch(`${API_URL}/projects`);
@@ -2989,6 +3084,7 @@ async function fetchProjects() {
                 || Number(updated.analysis_eta_seconds ?? -1) !== Number(currentProject.analysis_eta_seconds ?? -1)
                 || Number(updated.analysis_window_index || 0) !== Number(currentProject.analysis_window_index || 0)
                 || Number(updated.analysis_window_total || 0) !== Number(currentProject.analysis_window_total || 0)
+                || topicModelSignature(updated) !== topicModelSignature(currentProject)
             );
             if (shouldRefreshDetail) {
                 showDetail(updated.id);
@@ -3152,6 +3248,9 @@ async function showDetail(projectId) {
         ? `${project.ml_detection_status || 'Unknown'} (${project.ml_detection_error})`
         : (project.ml_detection_status || 'Unknown');
     document.getElementById('mlDetectionStatus').innerText = mlStatus;
+    if (vulnerabilityScanStatus) {
+        vulnerabilityScanStatus.innerText = project?.vulnerability_analysis_enabled ? 'Enabled' : 'Disabled';
+    }
     renderAnalysisEta(project);
     renderProjectPosition();
 

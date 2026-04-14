@@ -8,6 +8,8 @@ from models.schemas import Commit
 class RSZZAnalyzer:
     def __init__(self, repo_path: str):
         self.repo_path = repo_path
+        self._blame_cache: Dict[Tuple[str, str], Dict[int, str]] = {}
+        self._meta_cache: Dict[str, bool] = {}
 
     def identify_bug_inducing_commits(self, all_commits: List[Commit]) -> List[str]:
         """
@@ -18,6 +20,9 @@ class RSZZAnalyzer:
         4) filter cosmetic/meta candidates
         5) pick most recent candidate per fix commit
         """
+        self._blame_cache.clear()
+        self._meta_cache.clear()
+        
         commit_by_hash: Dict[str, Commit] = {c.hash: c for c in all_commits}
         fix_commits = [c for c in all_commits if self._is_fix_commit(c)]
         inducing_hashes: Set[str] = set()
@@ -68,13 +73,22 @@ class RSZZAnalyzer:
                 "git", "diff", "--unified=0", "--no-color",
                 f"{fix_hash}^", fix_hash, "--", file_path
             ]
-            result = subprocess.run(cmd, cwd=self.repo_path, capture_output=True, text=True, check=True)
+            result = subprocess.run(
+                cmd,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
         except Exception:
             return []
 
         deleted: List[Tuple[int, str]] = []
         old_line = 0
-        for raw in result.stdout.splitlines():
+        stdout = result.stdout or ""
+        for raw in stdout.splitlines():
             if raw.startswith("@@"):
                 # Example: @@ -10,2 +10,0 @@
                 m = re.search(r"@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@", raw)
@@ -95,19 +109,29 @@ class RSZZAnalyzer:
         return deleted
 
     def _blame_line_before_fix(self, fix_hash: str, file_path: str, line_no: int) -> Optional[str]:
-        try:
-            cmd = [
-                "git", "blame", "--line-porcelain",
-                "-L", f"{line_no},{line_no}",
-                f"{fix_hash}^", "--", file_path
-            ]
-            result = subprocess.run(cmd, cwd=self.repo_path, capture_output=True, text=True, check=True)
-        except Exception:
-            return None
+        parent_ref = f"{fix_hash}^"
+        cache_key = (parent_ref, file_path)
+        
+        if cache_key not in self._blame_cache:
+            # Fetch entire file blame once to optimize repeated lookups in the same file
+            try:
+                cmd = ["git", "blame", "--porcelain", parent_ref, "--", file_path]
+                res = subprocess.run(
+                    cmd, cwd=self.repo_path, capture_output=True, text=True,
+                    encoding="utf-8", errors="replace", check=True
+                )
+                file_blame = {}
+                for line in res.stdout.splitlines():
+                    m = re.match(r"^([0-9a-f]{40})\s(\d+)\s(\d+)", line)
+                    if m:
+                        current_hash = m.group(1)[:40]
+                        final_line_no = int(m.group(3))
+                        file_blame[final_line_no] = current_hash
+                self._blame_cache[cache_key] = file_blame
+            except Exception:
+                self._blame_cache[cache_key] = {}
 
-        first = result.stdout.splitlines()[0] if result.stdout else ""
-        m = re.match(r"^([0-9a-f]{7,40})\s", first)
-        return m.group(1) if m else None
+        return self._blame_cache[cache_key].get(line_no)
 
     @staticmethod
     def _is_cosmetic_line(text: str) -> bool:
@@ -121,16 +145,28 @@ class RSZZAnalyzer:
         return False
 
     def _is_meta_change(self, commit_hash: str) -> bool:
+        if commit_hash in self._meta_cache:
+            return self._meta_cache[commit_hash]
+            
         try:
             parents_cmd = ["git", "rev-list", "--parents", "-n", "1", commit_hash]
-            parents_res = subprocess.run(parents_cmd, cwd=self.repo_path, capture_output=True, text=True, check=True)
+            parents_res = subprocess.run(
+                parents_cmd,
+                cwd=self.repo_path,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
             fields = parents_res.stdout.strip().split()
             # commit + >=2 parents => merge commit
-            if len(fields) > 2:
-                return True
+            result = len(fields) > 2
         except Exception:
-            return False
-        return False
+            result = False
+            
+        self._meta_cache[commit_hash] = result
+        return result
 
     @staticmethod
     def _select_most_recent(candidates: Set[str], commit_by_hash: Dict[str, Commit]) -> Optional[str]:

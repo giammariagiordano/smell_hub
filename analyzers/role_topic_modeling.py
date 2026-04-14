@@ -1,6 +1,7 @@
 import json
 import os
 import re
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -325,8 +326,203 @@ class RoleTopicModelingAnalyzer:
         rationale = str(judge_result.get("rationale") or "").strip()
         return updated, rationale
 
-    def analyze_documents(self, documents: List[Dict[str, Any]], scope_label: str) -> TopicModelingResult:
-        prepared = self._prepare_documents(documents or [])
+    def prepare_documents_incremental(self) -> Dict[str, Any]:
+        return {
+            "source_map": {},
+            "source_breakdown": {},
+            "documents_count_by_role": {role: 0 for role in self.ROLE_ORDER},
+            "role_documents": {role: [] for role in self.ROLE_ORDER},
+            "developer_documents": {},
+            "developer_role_map": {},
+            "thread_map": {},
+            "source_count": 0,
+            "document_index": 0,
+        }
+
+    def add_document_to_prepared(self, accumulator: Dict[str, Any], doc: Dict[str, Any]) -> bool:
+        role = self._normalize_role(doc.get("role"))
+        developer_id = str(doc.get("developer_id") or "").strip()
+        text = self._clean_text(doc.get("text"))
+        raw_source_id = str(doc.get("source_id") or "").strip()
+        source_id = raw_source_id or (
+            f"legacy:{doc.get('project_id') or 'project'}:"
+            f"{doc.get('time_window_id') or 'window'}:"
+            f"{developer_id}:{doc.get('source_type') or 'unknown'}:{int(accumulator.get('document_index') or 0)}"
+        )
+        if role not in self.ROLE_ORDER or not developer_id or not text:
+            return False
+
+        sort_key = (
+            str(doc.get("timestamp") or ""),
+            int(accumulator.get("document_index") or 0),
+        )
+        accumulator["document_index"] = int(accumulator.get("document_index") or 0) + 1
+        accumulator["source_count"] = int(accumulator.get("source_count") or 0) + 1
+        documents_count_by_role = accumulator.setdefault(
+            "documents_count_by_role",
+            {role_name: 0 for role_name in self.ROLE_ORDER},
+        )
+        documents_count_by_role[role] = int(documents_count_by_role.get(role, 0)) + 1
+
+        developer_role_map = accumulator.setdefault("developer_role_map", {})
+        developer_role_map[developer_id] = role
+
+        source_row = {
+            "source_id": source_id,
+            "label": str(doc.get("source_label") or doc.get("thread_label") or source_id),
+            "url": str(doc.get("source_url") or doc.get("thread_url") or ""),
+            "source_type": str(doc.get("source_type") or ""),
+            "is_open": bool(doc.get("is_open")),
+            "thread_id": str(doc.get("thread_id") or source_id).strip() or source_id,
+        }
+        source_map = accumulator.setdefault("source_map", {})
+        source_map[source_id] = source_row
+
+        source_breakdown = accumulator.setdefault("source_breakdown", {})
+        source_kind = source_row["source_type"]
+        source_breakdown[source_kind] = int(source_breakdown.get(source_kind, 0)) + 1
+
+        compact = {
+            "source_id": source_id,
+            "developer_id": developer_id,
+            "role": role,
+            "text": text,
+            "source_type": source_row["source_type"],
+            "label": source_row["label"],
+            "is_open": source_row["is_open"],
+            "thread_id": source_row["thread_id"],
+            "_sort_key": sort_key,
+        }
+
+        role_documents = accumulator.setdefault("role_documents", {role_name: [] for role_name in self.ROLE_ORDER})
+        role_documents.setdefault(role, []).append(compact)
+
+        developer_documents = accumulator.setdefault("developer_documents", {})
+        dev_row = developer_documents.get(developer_id)
+        if dev_row is None:
+            dev_row = {
+                "developer_id": developer_id,
+                "role": role,
+                "documents_count": 0,
+                "documents": [],
+                "_latest_sort_key": sort_key,
+            }
+            developer_documents[developer_id] = dev_row
+        dev_row["documents_count"] = int(dev_row.get("documents_count") or 0) + 1
+        if sort_key >= tuple(dev_row.get("_latest_sort_key") or ("", -1)):
+            dev_row["role"] = role
+            dev_row["_latest_sort_key"] = sort_key
+        dev_row.setdefault("documents", []).append(compact)
+
+        thread_id = str(doc.get("thread_id") or source_id).strip()
+        thread_map = accumulator.setdefault("thread_map", {})
+        thread = thread_map.get(thread_id)
+        if thread is None:
+            thread = {
+                "thread_id": thread_id,
+                "thread_label": str(doc.get("thread_label") or source_row["label"]),
+                "thread_url": str(doc.get("thread_url") or source_row["url"]),
+                "source_type": source_row["source_type"],
+                "is_open": bool(doc.get("thread_is_open", doc.get("is_open"))),
+                "participants": {},
+                "items": [],
+                "_first_sort_key": sort_key,
+            }
+            thread_map[thread_id] = thread
+        elif sort_key < tuple(thread.get("_first_sort_key") or ("", 0)):
+            thread["thread_label"] = str(doc.get("thread_label") or source_row["label"])
+            thread["thread_url"] = str(doc.get("thread_url") or source_row["url"])
+            thread["source_type"] = source_row["source_type"]
+            thread["is_open"] = bool(doc.get("thread_is_open", doc.get("is_open")))
+            thread["_first_sort_key"] = sort_key
+        thread["participants"][developer_id] = role
+        thread["items"].append(compact)
+        return True
+
+    def finalize_prepared_documents(self, accumulator: Dict[str, Any]) -> Dict[str, Any]:
+        role_documents = accumulator.get("role_documents") or {}
+        role_samples: Dict[str, List[Dict[str, Any]]] = {role: [] for role in self.ROLE_ORDER}
+        for role in self.ROLE_ORDER:
+            rows = sorted(
+                [item for item in (role_documents.get(role) or []) if isinstance(item, dict)],
+                key=lambda item: item.get("_sort_key") or ("", 0),
+            )[: self.max_docs_per_role]
+            role_samples[role] = [self._strip_internal_sort_key(item) for item in rows]
+
+        developer_samples = []
+        developer_documents = accumulator.get("developer_documents") or {}
+        for developer_id, developer in developer_documents.items():
+            if not isinstance(developer, dict):
+                continue
+            docs = sorted(
+                [item for item in (developer.get("documents") or []) if isinstance(item, dict)],
+                key=lambda item: item.get("_sort_key") or ("", 0),
+            )[: self.max_docs_per_developer]
+            developer_samples.append(
+                {
+                    "developer_id": str(developer_id or ""),
+                    "role": str(developer.get("role") or ""),
+                    "documents_count": int(developer.get("documents_count") or 0),
+                    "samples": [self._strip_internal_sort_key(item) for item in docs],
+                }
+            )
+        developer_samples.sort(key=lambda item: (-(item.get("documents_count") or 0), str(item.get("developer_id") or "")))
+
+        thread_map = accumulator.get("thread_map") or {}
+        threads = []
+        for thread in thread_map.values():
+            if not isinstance(thread, dict):
+                continue
+            items = sorted(
+                [item for item in (thread.get("items") or []) if isinstance(item, dict)],
+                key=lambda item: item.get("_sort_key") or ("", 0),
+            )[: self.max_items_per_thread]
+            threads.append(
+                {
+                    "thread_id": str(thread.get("thread_id") or ""),
+                    "thread_label": str(thread.get("thread_label") or ""),
+                    "thread_url": str(thread.get("thread_url") or ""),
+                    "source_type": str(thread.get("source_type") or ""),
+                    "is_open": bool(thread.get("is_open")),
+                    "participants": [
+                        {"developer_id": dev_id, "role": role}
+                        for dev_id, role in sorted((thread.get("participants") or {}).items())
+                    ],
+                    "items": [self._strip_internal_sort_key(item) for item in items],
+                }
+            )
+        threads = sorted(
+            threads,
+            key=lambda item: (
+                -(len(item.get("participants") or [])),
+                -(len(item.get("items") or [])),
+                str(item.get("thread_label") or ""),
+            ),
+        )[: self.max_threads]
+        source_breakdown = dict(accumulator.get("source_breakdown") or {})
+        discussion_source_count = sum(
+            count for source_type, count in source_breakdown.items()
+            if source_type in self.DISCUSSION_SOURCE_TYPES
+        )
+        potential_conflict_threads = self._collect_conflict_candidate_threads(threads)
+
+        return {
+            "source_count": int(accumulator.get("source_count") or 0),
+            "source_map": dict(accumulator.get("source_map") or {}),
+            "source_breakdown": source_breakdown,
+            "discussion_source_count": discussion_source_count,
+            "documents_count_by_role": dict(accumulator.get("documents_count_by_role") or {}),
+            "developer_role_map": dict(accumulator.get("developer_role_map") or {}),
+            "role_samples": role_samples,
+            "developer_samples": developer_samples,
+            "potential_conflict_threads": potential_conflict_threads,
+            "threads": threads,
+        }
+
+    def _strip_internal_sort_key(self, item: Dict[str, Any]) -> Dict[str, Any]:
+        return {key: value for key, value in item.items() if key != "_sort_key"}
+
+    def analyze_prepared_documents(self, prepared: Dict[str, Any], scope_label: str) -> TopicModelingResult:
         source_count = int(prepared.get("source_count", 0))
         source_map = dict(prepared.get("source_map") or {})
         developer_role_map = dict(prepared.get("developer_role_map") or {})
@@ -372,12 +568,35 @@ class RoleTopicModelingAnalyzer:
         try:
             candidate_runs: List[Dict[str, Any]] = []
             candidate_errors: List[str] = []
-            for run_index in range(self.run_count):
+            if self.run_count <= 1:
                 try:
-                    candidate_data = self._run_candidate_analysis(scope_label, prepared, run_index, self.run_count)
-                    candidate_runs.append({"run_index": run_index + 1, "data": candidate_data})
+                    candidate_data = self._run_candidate_analysis(scope_label, prepared, 0, self.run_count)
+                    candidate_runs.append({"run_index": 1, "data": candidate_data})
                 except Exception as run_error:
-                    candidate_errors.append(f"run {run_index + 1}: {str(run_error)}")
+                    candidate_errors.append(f"run 1: {str(run_error)}")
+            else:
+                with ThreadPoolExecutor(max_workers=self.run_count) as pool:
+                    future_map = {
+                        pool.submit(
+                            self._run_candidate_analysis,
+                            scope_label,
+                            prepared,
+                            run_index,
+                            self.run_count,
+                        ): run_index
+                        for run_index in range(self.run_count)
+                    }
+                    successful_runs: Dict[int, Dict[str, Any]] = {}
+                    for future in as_completed(future_map):
+                        run_index = future_map[future]
+                        try:
+                            successful_runs[run_index] = future.result()
+                        except Exception as run_error:
+                            candidate_errors.append(f"run {run_index + 1}: {str(run_error)}")
+                    for run_index in range(self.run_count):
+                        candidate_data = successful_runs.get(run_index)
+                        if candidate_data is not None:
+                            candidate_runs.append({"run_index": run_index + 1, "data": candidate_data})
 
             if not candidate_runs:
                 raise RuntimeError("All LLM runs failed. " + " | ".join(candidate_errors[:4]))
@@ -459,125 +678,17 @@ class RoleTopicModelingAnalyzer:
                 error=str(e),
             )
 
+    def analyze_documents(self, documents: List[Dict[str, Any]], scope_label: str) -> TopicModelingResult:
+        prepared = self._prepare_documents(documents or [])
+        return self.analyze_prepared_documents(prepared, scope_label)
+
     def _prepare_documents(self, documents: List[Dict[str, Any]]) -> Dict[str, Any]:
-        source_map: Dict[str, Dict[str, Any]] = {}
-        source_breakdown: Dict[str, int] = {}
-        documents_count_by_role = {role: 0 for role in self.ROLE_ORDER}
-        role_samples: Dict[str, List[Dict[str, Any]]] = {role: [] for role in self.ROLE_ORDER}
-        developer_samples: Dict[str, Dict[str, Any]] = {}
-        developer_role_map: Dict[str, str] = {}
-        thread_map: Dict[str, Dict[str, Any]] = {}
-        total = 0
-
+        accumulator = self.prepare_documents_incremental()
         sorted_docs = sorted(documents, key=lambda d: str(d.get("timestamp") or ""))
-        for index, doc in enumerate(sorted_docs):
-            role = self._normalize_role(doc.get("role"))
-            developer_id = str(doc.get("developer_id") or "").strip()
-            text = self._clean_text(doc.get("text"))
-            raw_source_id = str(doc.get("source_id") or "").strip()
-            source_id = raw_source_id or (
-                f"legacy:{doc.get('project_id') or 'project'}:"
-                f"{doc.get('time_window_id') or 'window'}:"
-                f"{developer_id}:{doc.get('source_type') or 'unknown'}:{index}"
-            )
-            if role not in self.ROLE_ORDER or not developer_id or not text:
-                continue
-
-            total += 1
-            documents_count_by_role[role] += 1
-            developer_role_map[developer_id] = role
-
-            source_row = {
-                "source_id": source_id,
-                "label": str(doc.get("source_label") or doc.get("thread_label") or source_id),
-                "url": str(doc.get("source_url") or doc.get("thread_url") or ""),
-                "source_type": str(doc.get("source_type") or ""),
-                "is_open": bool(doc.get("is_open")),
-                "thread_id": str(doc.get("thread_id") or source_id).strip() or source_id,
-            }
-            source_map[source_id] = source_row
-            source_breakdown[source_row["source_type"]] = int(source_breakdown.get(source_row["source_type"], 0)) + 1
-
-            compact = {
-                "source_id": source_id,
-                "developer_id": developer_id,
-                "role": role,
-                "text": text,
-                "source_type": source_row["source_type"],
-                "label": source_row["label"],
-                "is_open": source_row["is_open"],
-                "thread_id": source_row["thread_id"],
-            }
-
-            if len(role_samples[role]) < self.max_docs_per_role:
-                role_samples[role].append(compact)
-
-            dev_row = developer_samples.get(developer_id)
-            if dev_row is None:
-                dev_row = {
-                    "developer_id": developer_id,
-                    "role": role,
-                    "documents_count": 0,
-                    "samples": [],
-                }
-                developer_samples[developer_id] = dev_row
-            dev_row["documents_count"] += 1
-            if len(dev_row["samples"]) < self.max_docs_per_developer:
-                dev_row["samples"].append(compact)
-
-            thread_id = str(doc.get("thread_id") or source_id).strip()
-            thread = thread_map.get(thread_id)
-            if thread is None:
-                thread = {
-                    "thread_id": thread_id,
-                    "thread_label": str(doc.get("thread_label") or source_row["label"]),
-                    "thread_url": str(doc.get("thread_url") or source_row["url"]),
-                    "source_type": source_row["source_type"],
-                    "is_open": bool(doc.get("thread_is_open", doc.get("is_open"))),
-                    "participants": {},
-                    "items": [],
-                }
-                thread_map[thread_id] = thread
-            thread["participants"][developer_id] = role
-            if len(thread["items"]) < self.max_items_per_thread:
-                thread["items"].append(compact)
-
-        threads = sorted(
-            thread_map.values(),
-            key=lambda item: (-(len(item.get("participants") or {})), -(len(item.get("items") or [])), str(item.get("thread_label") or "")),
-        )[: self.max_threads]
-        discussion_source_count = sum(
-            count for source_type, count in source_breakdown.items()
-            if source_type in self.DISCUSSION_SOURCE_TYPES
-        )
-        potential_conflict_threads = self._collect_conflict_candidate_threads(threads)
-
-        return {
-            "source_count": total,
-            "source_map": source_map,
-            "source_breakdown": source_breakdown,
-            "discussion_source_count": discussion_source_count,
-            "documents_count_by_role": documents_count_by_role,
-            "developer_role_map": developer_role_map,
-            "role_samples": role_samples,
-            "developer_samples": sorted(developer_samples.values(), key=lambda item: (-(item.get("documents_count") or 0), str(item.get("developer_id") or ""))),
-            "potential_conflict_threads": potential_conflict_threads,
-            "threads": [
-                {
-                    "thread_id": thread["thread_id"],
-                    "thread_label": thread["thread_label"],
-                    "thread_url": thread["thread_url"],
-                    "source_type": thread["source_type"],
-                    "is_open": bool(thread["is_open"]),
-                    "participants": [
-                        {"developer_id": dev_id, "role": role}
-                        for dev_id, role in sorted(thread["participants"].items())
-                    ],
-                    "items": thread["items"],
-                }
-                for thread in threads
-            ],
-        }
+        for doc in sorted_docs:
+            if isinstance(doc, dict):
+                self.add_document_to_prepared(accumulator, doc)
+        return self.finalize_prepared_documents(accumulator)
 
     def _system_prompt(self) -> str:
         return (

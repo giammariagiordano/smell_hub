@@ -24,7 +24,8 @@ For each tracked repository, the system:
 
 ## Main features
 
-- Project tracking by Git URL or local absolute path.
+- Project tracking by Git URL, local repository path, or a parent folder that contains multiple Git repositories.
+- Vulnerability scanning can be toggled per project at import time and defaults to off in the UI.
 - Bulk project creation and analysis (`/projects/bulk`).
 - Historical analysis in 3-month windows (forward/backward navigation in UI).
 - Community smell evidence in results.
@@ -81,18 +82,50 @@ Optional environment variables used by the backend:
 
 - `GITHUB_TOKEN`: GitHub API token (recommended to reduce rate-limit issues).
 - `PRONOUN_PARADIGMS_FILE`: custom pronoun paradigms file path.
+- `ANALYSIS_ENABLE_VULNERABILITIES` (default `true`): enable or disable Bandit vulnerability scanning.
 - `GITHUB_PROFILE_LOOKUP_LIMIT` (default `120`): max GitHub profile lookups per analysis.
 - `DEV_SENTIMENT_TRAIN_LIMIT` (default `1200`): max training rows for first-run sentiment training.
 - `DEV_SENTIMENT_BATCH_SIZE` (default `16`)
+- `DEV_SENTIMENT_INFER_BATCH_SIZE` (default `64`): inference batch size for developer sentiment.
 - `DEV_SENTIMENT_EPOCHS` (default `1`)
 - `DEV_SENTIMENT_LR` (default `2e-5`)
+- `GITHUB_HTTP_TIMEOUT_SEC` (default `6`): timeout per GitHub API request.
+- `GITHUB_FETCH_PARALLELISM`: concurrent workers for GitHub issue/PR data collection.
+- `GITHUB_PROFILE_PARALLELISM`: concurrent workers for GitHub profile enrichment.
+- `SMELLHUB_CODESMILE_WORKERS` (default `cpu_count`): per-project file-analysis workers used by CodeSmile.
+
+### Performance Notes
+
+The backend now preserves full data collection and speeds it up by:
+
+- fetching GitHub issue/PR data in parallel,
+- reusing shared GitHub response cache,
+- running ML/DPy/Bandit snapshot analyzers in parallel,
+- parallelizing CodeSmile file inspection inside each single-project snapshot,
+- skipping non-source folders during CodeSmile Python file discovery,
+- batching sentiment inference across all developers/messages.
+
+If vulnerability scanning is not important for your workflow, you can disable Bandit entirely:
+
+```powershell
+$env:ANALYSIS_ENABLE_VULNERABILITIES = "false"
+```
+
+If you have a very powerful machine and want to push throughput higher without skipping any data, you can increase these:
+
+```powershell
+$env:GITHUB_FETCH_PARALLELISM = "32"
+$env:GITHUB_PROFILE_PARALLELISM = "32"
+$env:DEV_SENTIMENT_INFER_BATCH_SIZE = "128"
+$env:SMELLHUB_CODESMILE_WORKERS = "32"
+```
 
 ## How to run
 
 From project root:
 
 ```bash
-python3 -m uvicorn api.main:app --host 127.0.0.1 --port 8001
+python -m uvicorn api.main:app --host 127.0.0.1 --port 8001
 ```
 
 Open:
@@ -115,13 +148,13 @@ pip install pyinstaller
 2. Build the executable for your OS:
 
 ```bash
-python3 scripts/build_executable.py
+python scripts/build_executable.py
 ```
 
 Single-binary option:
 
 ```bash
-python3 scripts/build_executable.py --onefile
+python scripts/build_executable.py --onefile
 ```
 
 3. Run:
@@ -151,6 +184,7 @@ Operational notes:
 
 - Use `url` for clone-based creation.
 - Use absolute `local_path` for existing local repo.
+- In the UI import modal, `local_path` can also point to a parent folder; SmellHub will discover and import every Git repository inside it recursively, without needing GitHub URLs.
 
 ### Create many projects at once
 
@@ -299,11 +333,15 @@ lsof -n -P -iTCP:8001 -sTCP:LISTEN
   - `./smell_ai`
 - Some windows may legitimately report 0 findings.
 
-Linux note for DPy:
+DPy note:
 
-- If your Linux binary is not named exactly `DPy`, set:
-  - `export DPY_BINARY=/absolute/path/to/your/dpy-binary`
-- Ensure execute permission:
+- The loader now checks platform-specific folders under the project root first:
+  - Windows: `DPy_WINDOWS/DPy.exe`
+  - macOS: `DPy_MACOS/DPy`
+- If your platform-specific binary is not named exactly `DPy` or `DPy.exe`, set:
+  - macOS/Linux: `export DPY_BINARY=/absolute/path/to/your/dpy-binary`
+  - Windows PowerShell: `$env:DPY_BINARY='C:\absolute\path\to\your\dpy-binary.exe'`
+- On macOS/Linux, ensure execute permission when needed:
   - `chmod +x /absolute/path/to/your/dpy-binary`
 
 ## Current limitations

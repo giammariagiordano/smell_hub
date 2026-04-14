@@ -11,7 +11,7 @@ def test_cli_calls_project_analyzer(mock_analyzer):
     args = Mock(
         input="/fake/input",
         output="/fake/output",
-        max_workers=1,
+        max_walkers=1,
         parallel=False,
         resume=False,
         multiple=False,
@@ -24,7 +24,7 @@ def test_cli_calls_project_analyzer(mock_analyzer):
 
     mock_analyzer.assert_called_once_with("/fake/output")
     mock_instance.analyze_project.assert_called_once_with(
-        "/fake/input", generate_graph=False
+        "/fake/input", generate_graph=False, max_workers=1
     )
 
 

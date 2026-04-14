@@ -102,6 +102,26 @@ def test_get_python_files(mock_walk):
     )  # Non-Python file
 
 
+def test_get_python_files_skips_non_source_directories(tmp_path):
+    repo_root = tmp_path / "repo"
+    (repo_root / ".git").mkdir(parents=True)
+    (repo_root / ".venv").mkdir()
+    (repo_root / "node_modules").mkdir()
+    (repo_root / "__pycache__").mkdir()
+    (repo_root / "src").mkdir()
+
+    (repo_root / ".git" / "ignored.py").write_text("print('ignored')", encoding="utf-8")
+    (repo_root / ".venv" / "ignored.py").write_text("print('ignored')", encoding="utf-8")
+    (repo_root / "node_modules" / "ignored.py").write_text("print('ignored')", encoding="utf-8")
+    (repo_root / "__pycache__" / "ignored.py").write_text("print('ignored')", encoding="utf-8")
+    kept_file = repo_root / "src" / "kept.py"
+    kept_file.write_text("print('kept')", encoding="utf-8")
+
+    python_files = FileUtils.get_python_files(str(repo_root))
+
+    assert python_files == [os.path.abspath(str(kept_file))]
+
+
 def test_merge_results(mock_merge):
     mock_makedirs, mock_walk, mock_read_csv, mock_to_csv = mock_merge
 

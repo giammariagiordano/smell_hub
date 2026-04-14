@@ -10,31 +10,43 @@ class NetworkBuilder:
         self.dependency_graph = nx.DiGraph()  # File-File
         self.bipartite_collaboration = nx.Graph() # Dev-File
         self.communication_source = "none"
+        self.developer_files: Dict[str, Set[str]] = {}
+        self.file_developers: Dict[str, Set[str]] = {}
 
     def build_collaboration_network(self, commits: List[Commit]):
         """Builds both bipartite (Dev-File) and projected (Dev-Dev) collaboration networks."""
         self.bipartite_collaboration.clear()
         self.collaboration_graph.clear()
-        
+        self.developer_files = {}
+        self.file_developers = {}
+
         for commit in commits:
             author_id = commit.author_id
+            if not author_id:
+                continue
             self.bipartite_collaboration.add_node(author_id, type='developer')
+            self.collaboration_graph.add_node(author_id)
+            author_files = self.developer_files.setdefault(author_id, set())
             for file_path in commit.files_modified:
+                if not file_path:
+                    continue
                 self.bipartite_collaboration.add_node(file_path, type='file')
                 self.bipartite_collaboration.add_edge(author_id, file_path)
-        
-        # Project to Dev-Dev
-        developers = [n for n, d in self.bipartite_collaboration.nodes(data=True) if d.get('type') == 'developer']
-        # Two developers collaborate if they modify the same file
-        for i, dev1 in enumerate(developers):
-            for dev2 in developers[i+1:]:
-                # Check for common neighbors (files)
-                common_files = set(self.bipartite_collaboration.neighbors(dev1)) & set(self.bipartite_collaboration.neighbors(dev2))
-                if common_files:
-                    if self.collaboration_graph.has_edge(dev1, dev2):
-                        self.collaboration_graph[dev1][dev2]['weight'] += len(common_files)
-                    else:
-                        self.collaboration_graph.add_edge(dev1, dev2, weight=len(common_files))
+                author_files.add(file_path)
+                self.file_developers.setdefault(file_path, set()).add(author_id)
+
+        edge_weights: Dict[Tuple[str, str], int] = {}
+        for developers in self.file_developers.values():
+            developer_list = sorted(dev for dev in developers if dev)
+            if len(developer_list) < 2:
+                continue
+            for i, dev1 in enumerate(developer_list):
+                for dev2 in developer_list[i + 1:]:
+                    edge_key = (dev1, dev2)
+                    edge_weights[edge_key] = int(edge_weights.get(edge_key, 0)) + 1
+
+        for (dev1, dev2), weight in edge_weights.items():
+            self.collaboration_graph.add_edge(dev1, dev2, weight=weight)
 
     def build_communication_network(self, interactions: List[Tuple[str, str, datetime]]):
         """Builds communication network from (sender_id, receiver_id, timestamp) tuples."""

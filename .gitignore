@@ -21,3 +21,9 @@ data/llm_settings.json
 build/
 dist/
 *.zip
+
+# Local outputs and logs
+output/
+benchmark_output_parallel/
+benchmark_output_sequential/
+*.log

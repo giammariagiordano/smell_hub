@@ -2,6 +2,7 @@ import json
 import os
 import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Dict, List, Optional
 
@@ -24,6 +25,16 @@ class BanditVulnerabilityAnalyzer:
     def _slug(raw: str) -> str:
         return (raw or "").strip().lower().replace("-", "_").replace(" ", "_")
 
+    @staticmethod
+    def _python_cmd() -> List[str]:
+        override = (os.environ.get("SMELLHUB_PYTHON_EXECUTABLE", "") or "").strip()
+        if override:
+            return [override]
+        if sys.executable:
+            return [sys.executable]
+        fallback = shutil.which("python") or shutil.which("python3")
+        return [fallback or "python"]
+
     def _blame_author_email(self, repo_path: str, file_path: str, line: Optional[int]) -> Optional[str]:
         if not line or not file_path:
             return None
@@ -36,10 +47,18 @@ class BanditVulnerabilityAnalyzer:
             "-L", f"{line},{line}", rel
         ]
         try:
-            res = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            res = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=True,
+            )
         except Exception:
             return None
-        for row in res.stdout.splitlines():
+        stdout = res.stdout or ""
+        for row in stdout.splitlines():
             if row.startswith("author-mail "):
                 return row.split(" ", 1)[1].strip().strip("<>").lower()
         return None
@@ -50,12 +69,20 @@ class BanditVulnerabilityAnalyzer:
             base_cmd = [self.bandit_bin]
         else:
             # Fallback to python module if executable is not in PATH.
-            base_cmd = ["python3", "-m", "bandit"]
+            base_cmd = self._python_cmd() + ["-m", "bandit"]
 
         cmd = base_cmd + ["-r", root_dir, "-f", "json", "-o", out_path, "-q"]
         try:
             # Bandit returns non-zero when findings exist; ignore return code.
-            subprocess.run(cmd, capture_output=True, text=True, check=False, timeout=300)
+            subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+                check=False,
+                timeout=300,
+            )
             return os.path.exists(out_path)
         except Exception:
             return False
@@ -65,7 +92,7 @@ class BanditVulnerabilityAnalyzer:
         root_dir: str,
         email_to_dev_id: Optional[Dict[str, str]] = None
     ) -> List[VulnerabilityInstance]:
-        with tempfile.TemporaryDirectory(prefix="bandit_", dir="/tmp") as tmp:
+        with tempfile.TemporaryDirectory(prefix="bandit_") as tmp:
             report = os.path.join(tmp, "bandit.json")
             if not self._run_bandit(root_dir, report):
                 return []

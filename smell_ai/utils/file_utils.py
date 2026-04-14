@@ -8,6 +8,21 @@ class FileUtils:
     Handles file and directory-related operations.
     """
 
+    EXCLUDED_PYTHON_SCAN_DIRS = {
+        ".git",
+        ".hg",
+        ".svn",
+        ".venv",
+        "venv",
+        "env",
+        "__pycache__",
+        ".pytest_cache",
+        ".mypy_cache",
+        ".ruff_cache",
+        ".tox",
+        "node_modules",
+    }
+
     @staticmethod
     def clean_directory(root_path: str, subfolder_name: str = "output") -> str:
         """
@@ -53,10 +68,12 @@ class FileUtils:
             return [path]
 
         for root, dirs, files in os.walk(path):
-            if "venv" in dirs:
-                dirs.remove("venv")
-            if "lib" in dirs:
-                dirs.remove("lib")
+            dirs[:] = [
+                dirname
+                for dirname in dirs
+                if dirname not in FileUtils.EXCLUDED_PYTHON_SCAN_DIRS
+                and dirname != "lib"
+            ]
             for file in files:
                 if file.endswith(".py"):
                     result.append(os.path.abspath(os.path.join(root, file)))

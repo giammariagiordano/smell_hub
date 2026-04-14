@@ -220,9 +220,17 @@ class DatasetEvaluator:
 
 
 def main():
-    # Percorsi di input e output
-    dataset_path = "datasets/injected.json"
-    output_path = "C:/Users/Xzeni/Desktop/results"
+    # Percorsi di input e output portabili
+    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    dataset_candidates = [
+        os.path.join(base_dir, "datasets", "injected.json"),
+        os.path.join(base_dir, "datasets", "injected_only_balanced_dataset.json"),
+    ]
+    dataset_path = next(
+        (path for path in dataset_candidates if os.path.exists(path)),
+        dataset_candidates[-1],
+    )
+    output_path = os.path.join(base_dir, "datasets", "output_analysis")
 
     # Inizializzazione e valutazione
     evaluator = DatasetEvaluator(

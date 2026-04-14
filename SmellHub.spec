@@ -1,12 +1,49 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from pathlib import Path
+
+
+PROJECT_ROOT = Path(__file__).resolve().parent
+
+
+def _existing_data_entries():
+    entries = []
+    names = [
+        "api",
+        "analyzers",
+        "core",
+        "models",
+        "utils",
+        "web",
+        "smell_ai",
+        "SE_Emotion_PTM-3589",
+        "DPy",
+        "DPy_WINDOWS",
+        "DPy_MACOS",
+        "requirements.txt",
+        "pronoun_paradigms_coling2022.txt",
+    ]
+    for name in names:
+        path = PROJECT_ROOT / name
+        if path.exists():
+            entries.append((str(path), name))
+    return entries
+
 
 a = Analysis(
-    ['/Users/broke31/Desktop/tool/launcher.py'],
-    pathex=['/Users/broke31/Desktop/tool'],
+    [str(PROJECT_ROOT / "launcher.py")],
+    pathex=[str(PROJECT_ROOT)],
     binaries=[],
-    datas=[('/Users/broke31/Desktop/tool/api', 'api'), ('/Users/broke31/Desktop/tool/analyzers', 'analyzers'), ('/Users/broke31/Desktop/tool/core', 'core'), ('/Users/broke31/Desktop/tool/models', 'models'), ('/Users/broke31/Desktop/tool/utils', 'utils'), ('/Users/broke31/Desktop/tool/web', 'web'), ('/Users/broke31/Desktop/tool/smell_ai', 'smell_ai'), ('/Users/broke31/Desktop/tool/SE_Emotion_PTM-3589', 'SE_Emotion_PTM-3589'), ('/Users/broke31/Desktop/tool/DPy', 'DPy'), ('/Users/broke31/Desktop/tool/requirements.txt', 'requirements.txt')],
-    hiddenimports=['api.main', 'fastapi.middleware.cors', 'fastapi.staticfiles', 'fastapi.responses', 'uvicorn', 'torch', 'transformers'],
+    datas=_existing_data_entries(),
+    hiddenimports=[
+        "api.main",
+        "fastapi.middleware.cors",
+        "fastapi.staticfiles",
+        "fastapi.responses",
+        "uvicorn",
+        "torch",
+        "transformers",
+    ],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -21,7 +58,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='SmellHub',
+    name="SmellHub",
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -40,5 +77,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='SmellHub',
+    name="SmellHub",
 )

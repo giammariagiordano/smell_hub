@@ -1,7 +1,9 @@
 import csv
 import json
 import os
+import shutil
 import subprocess
+import sys
 import tempfile
 from typing import Dict, List, Optional
 
@@ -30,13 +32,34 @@ class MLSmellAnalyzer:
     def _smell_id(raw: str) -> str:
         return (raw or "").strip().upper().replace(" ", "_")
 
+    @staticmethod
+    def _python_cmd() -> List[str]:
+        override = (os.environ.get("SMELLHUB_PYTHON_EXECUTABLE", "") or "").strip()
+        if override:
+            return [override]
+        if sys.executable:
+            return [sys.executable]
+        fallback = shutil.which("python") or shutil.which("python3")
+        return [fallback or "python"]
+
+    @classmethod
+    def _codesmile_workers(cls) -> int:
+        env_value = (
+            os.environ.get("SMELLHUB_CODESMILE_WORKERS", "")
+            or os.environ.get("CODESMILE_MAX_WORKERS", "")
+        )
+        parsed = cls._to_int(env_value) if env_value else None
+        if parsed and parsed > 0:
+            return parsed
+        return max(1, os.cpu_count() or 1)
+
     def _run_smell_ai(self, input_dir: str, output_dir: str) -> bool:
         if not os.path.isdir(self.smell_ai_root):
             self.last_status = "CodeSmile directory not found"
             self.last_error = f"Missing directory: {self.smell_ai_root}"
             return False
-        cmd = [
-            "python3",
+        worker_count = self._codesmile_workers()
+        cmd = self._python_cmd() + [
             "-m",
             "cli.cli_runner",
             "--input",
@@ -45,12 +68,16 @@ class MLSmellAnalyzer:
             output_dir,
             "--call-graph",
         ]
+        if worker_count > 1:
+            cmd.extend(["--parallel", "--max_walkers", str(worker_count)])
         try:
             result = subprocess.run(
                 cmd,
                 cwd=self.smell_ai_root,
                 capture_output=True,
                 text=True,
+                encoding="utf-8",
+                errors="replace",
                 check=False,
                 timeout=600,
             )
@@ -123,7 +150,7 @@ class MLSmellAnalyzer:
         self.last_call_graph_nodes = []
         self.last_call_graph_edges = []
 
-        with tempfile.TemporaryDirectory(prefix="smell_ai_", dir="/tmp") as out_dir:
+        with tempfile.TemporaryDirectory(prefix="smell_ai_") as out_dir:
             ok = self._run_smell_ai(root_dir, out_dir)
             if not ok:
                 return []

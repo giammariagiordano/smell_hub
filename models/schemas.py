@@ -237,6 +237,7 @@ class Project(BaseModel):
     name: str
     url: str
     local_path: str
+    vulnerability_analysis_enabled: bool = False
     last_analyzed: Optional[datetime] = None
     analysis_status: str = "None"  # None, Running, Completed, Error
     analysis_progress_pct: float = 0.0

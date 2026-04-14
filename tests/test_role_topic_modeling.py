@@ -1,10 +1,82 @@
 import unittest
+import threading
+import time
 from unittest.mock import MagicMock
 
 from analyzers.role_topic_modeling import RoleTopicModelingAnalyzer
 
 
 class TestRoleTopicModelingAnalyzer(unittest.TestCase):
+    def test_incremental_preparation_matches_full_prepare(self):
+        analyzer = RoleTopicModelingAnalyzer(config={})
+        documents = [
+            {
+                "project_id": "p1",
+                "project_name": "demo",
+                "time_window_id": "w2",
+                "time_window_label": "Window 2",
+                "source_id": "issue:42:comment:1",
+                "source_label": "Issue #42 comment",
+                "source_url": "https://example.test/issues/42#comment-1",
+                "source_type": "issue_comment",
+                "is_open": True,
+                "thread_id": "issue:42",
+                "thread_label": "Issue #42",
+                "thread_url": "https://example.test/issues/42",
+                "thread_is_open": True,
+                "developer_id": "bob",
+                "role": "AI/ML Engineer",
+                "text": "I disagree, the rollout should proceed this week.",
+                "timestamp": "2024-01-02T13:00:00",
+            },
+            {
+                "project_id": "p1",
+                "project_name": "demo",
+                "time_window_id": "w1",
+                "time_window_label": "Window 1",
+                "source_id": "issue:42",
+                "source_label": "Issue #42",
+                "source_url": "https://example.test/issues/42",
+                "source_type": "issue",
+                "is_open": True,
+                "thread_id": "issue:42",
+                "thread_label": "Issue #42",
+                "thread_url": "https://example.test/issues/42",
+                "thread_is_open": True,
+                "developer_id": "alice",
+                "role": "Software Engineer",
+                "text": "We should not ship this model until the evaluation bug is fixed.",
+                "timestamp": "2024-01-01T12:00:00",
+            },
+            {
+                "project_id": "p1",
+                "project_name": "demo",
+                "time_window_id": "w3",
+                "time_window_label": "Window 3",
+                "source_id": "commit:abc1234",
+                "source_label": "Commit abc1234",
+                "source_url": "https://example.test/commit/abc1234",
+                "source_type": "commit_message",
+                "is_open": False,
+                "thread_id": "commit:abc1234",
+                "thread_label": "Commit abc1234",
+                "thread_url": "https://example.test/commit/abc1234",
+                "thread_is_open": False,
+                "developer_id": "carol",
+                "role": "Hybrid",
+                "text": "Revert previous rollout attempt after failed benchmark.",
+                "timestamp": "2024-01-03T08:00:00",
+            },
+        ]
+
+        expected = analyzer._prepare_documents(documents)
+        accumulator = analyzer.prepare_documents_incremental()
+        for document in documents:
+            analyzer.add_document_to_prepared(accumulator, document)
+        actual = analyzer.finalize_prepared_documents(accumulator)
+
+        self.assertEqual(actual, expected)
+
     def test_build_result_expands_conflict_participants_from_discussion_thread(self):
         analyzer = RoleTopicModelingAnalyzer(config={})
         prepared = {
@@ -194,6 +266,96 @@ class TestRoleTopicModelingAnalyzer(unittest.TestCase):
             analyzer._request_structured_json.call_args.kwargs.get("schema_name"),
             "community_conflicts_judge",
         )
+
+    def test_analyze_prepared_documents_runs_candidate_llm_calls_in_parallel(self):
+        analyzer = RoleTopicModelingAnalyzer(
+            config={"api_key": "test-key", "model": "gpt-5-mini", "judge_model": "gpt-5-mini", "llm_runs": 3}
+        )
+        prepared = analyzer._prepare_documents(
+            [
+                {
+                    "project_id": "p1",
+                    "project_name": "demo",
+                    "time_window_id": "w1",
+                    "time_window_label": "Window 1",
+                    "source_id": "issue:42",
+                    "source_label": "Issue #42",
+                    "source_url": "https://example.test/issues/42",
+                    "source_type": "issue",
+                    "is_open": True,
+                    "thread_id": "issue:42",
+                    "thread_label": "Issue #42",
+                    "thread_url": "https://example.test/issues/42",
+                    "thread_is_open": True,
+                    "developer_id": "alice",
+                    "role": "Software Engineer",
+                    "text": "We should not ship this model until the evaluation bug is fixed.",
+                    "timestamp": "2024-01-01T12:00:00",
+                },
+                {
+                    "project_id": "p1",
+                    "project_name": "demo",
+                    "time_window_id": "w1",
+                    "time_window_label": "Window 1",
+                    "source_id": "issue:42:comment:1",
+                    "source_label": "Issue #42 comment",
+                    "source_url": "https://example.test/issues/42#comment-1",
+                    "source_type": "issue_comment",
+                    "is_open": True,
+                    "thread_id": "issue:42",
+                    "thread_label": "Issue #42",
+                    "thread_url": "https://example.test/issues/42",
+                    "thread_is_open": True,
+                    "developer_id": "bob",
+                    "role": "AI/ML Engineer",
+                    "text": "I disagree, the rollout should proceed this week.",
+                    "timestamp": "2024-01-01T13:00:00",
+                },
+            ]
+        )
+        state = {"active": 0, "max_active": 0}
+        state_lock = threading.Lock()
+
+        def fake_run_candidate(scope_label, prepared_payload, run_index, total_runs):
+            self.assertEqual(scope_label, "demo")
+            self.assertEqual(total_runs, 3)
+            with state_lock:
+                state["active"] += 1
+                state["max_active"] = max(state["max_active"], state["active"])
+            time.sleep(0.05)
+            with state_lock:
+                state["active"] -= 1
+            return {
+                "taxonomy_notes": [],
+                "roles": [],
+                "developers": [],
+                "conflicts": [],
+            }
+
+        analyzer._run_candidate_analysis = MagicMock(side_effect=fake_run_candidate)
+        analyzer._request_structured_json = MagicMock(
+            return_value={
+                "winner_index": 1,
+                "rationale": "Run 1 is the most consistent.",
+                "final_output": {
+                    "taxonomy_notes": [],
+                    "roles": [],
+                    "developers": [],
+                    "conflicts": [],
+                },
+            }
+        )
+        analyzer._run_conflict_judge = MagicMock(
+            side_effect=lambda **kwargs: (kwargs["final_data"], "Participants normalized.")
+        )
+
+        result = analyzer.analyze_prepared_documents(prepared, scope_label="demo")
+
+        self.assertEqual(result.status, "Completed")
+        self.assertGreaterEqual(state["max_active"], 2)
+        self.assertEqual(analyzer._run_candidate_analysis.call_count, 3)
+        self.assertEqual(analyzer._request_structured_json.call_count, 1)
+        self.assertTrue(result.judged)
 
 
 if __name__ == "__main__":

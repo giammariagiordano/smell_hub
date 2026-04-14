@@ -42,7 +42,7 @@ class CommunitySmellAnalyzer:
                     shared_files = []
                     try:
                         shared_files = sorted(
-                            list(set(self.nb.bipartite_collaboration.neighbors(u)) & set(self.nb.bipartite_collaboration.neighbors(v)))
+                            list(set(self.nb.developer_files.get(u, set())) & set(self.nb.developer_files.get(v, set())))
                         )
                     except Exception:
                         shared_files = []

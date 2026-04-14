@@ -1,4 +1,6 @@
 import os
+import shutil
+import subprocess
 import pandas as pd
 
 
@@ -42,8 +44,11 @@ class ProjectRepositoryCloner:
         build_path = os.path.abspath(build_path)
 
         if not os.path.exists(build_path):
-            os.mkdir(build_path)
-        os.system(f"git clone https://github.com/{repo_url} {build_path}")
+            os.makedirs(os.path.dirname(build_path), exist_ok=True)
+        subprocess.run(
+            ["git", "clone", f"https://github.com/{repo_url}", build_path],
+            check=True,
+        )
 
     def filter_repos(
         self, df: pd.DataFrame, stars: int = 200, commits: int = 100
@@ -112,12 +117,8 @@ class ProjectRepositoryCloner:
         - None
         """
         projects_path = os.path.join(self.base_path, "projects")
-        if os.name == "nt":
-            if os.path.exists(projects_path):
-                os.system(f"rmdir /s /q {projects_path}")
-        else:
-            if os.path.exists(projects_path):
-                os.system(f"rm -r {projects_path}")
+        if os.path.exists(projects_path):
+            shutil.rmtree(projects_path, ignore_errors=True)
 
     def setup(self):
         """

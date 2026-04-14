@@ -152,6 +152,9 @@
                         <div style="margin-top:0.6rem; font-size:0.85rem; color:#cbd5e1;">
                             ML Detector: <span id="mlDetectionStatus">Unknown</span>
                         </div>
+                        <div style="margin-top:0.35rem; font-size:0.82rem; color:#94a3b8;">
+                            Vulnerability Scan: <span id="vulnerabilityScanStatus">Disabled</span>
+                        </div>
                         <div id="analysisEta" style="margin-top:0.35rem; font-size:0.82rem; color:#94a3b8;">
                             Progress: 0.0% | ETA: n/a
                         </div>
@@ -371,8 +374,8 @@
                 </div>
                 <div class="form-group">
                     <label>Repository URLs</label>
-                    <textarea id="projUrls" required placeholder="https://github.com/org/repo-1.git&#10;https://github.com/org/repo-2.git"></textarea>
-                    <small style="color: var(--text-secondary);">One URL per line (you can also separate with commas).</small>
+                    <textarea id="projUrls" placeholder="https://github.com/org/repo-1.git&#10;https://github.com/org/repo-2.git"></textarea>
+                    <small style="color: var(--text-secondary);">Optional if you use the local path field below. One URL per line (you can also separate with commas).</small>
                     <div style="display:flex; gap:0.5rem; align-items:center; margin-top:0.6rem;">
                         <button id="prevRepoInListBtn" type="button" class="btn-secondary">← Previous</button>
                         <button id="nextRepoInListBtn" type="button" class="btn-secondary">Next →</button>
@@ -387,6 +390,16 @@
                     <input type="file" id="projCsvFile" accept=".csv,text/csv">
                     <small style="color: var(--text-secondary);">Columns supported: <code>url</code>, <code>name</code>, <code>local_path</code> (or aliases: <code>repo_url</code>, <code>repository_url</code>, <code>git_url</code>, <code>project_name</code>, <code>path</code>, <code>repo_path</code>).</small>
                 </div>
+                <div class="form-group">
+                    <label style="display:flex; align-items:flex-start; gap:0.65rem; cursor:pointer;">
+                        <input type="checkbox" id="projEnableVulnerabilities" style="margin-top:0.2rem;">
+                        <span>
+                            Enable vulnerability scan (Bandit)
+                            <br>
+                            <small style="color: var(--text-secondary);">Default off. Keep it disabled if you do not care about vulnerability results and want faster analyses.</small>
+                        </span>
+                    </label>
+                </div>
                 <div style="margin-bottom: 1rem; text-align: right;">
                     <a href="#" id="toggleAdvanced"
                         style="font-size: 0.8rem; color: var(--accent-color); text-decoration: none;">Show Advanced
@@ -395,8 +408,8 @@
                 <div id="advancedOptions" style="display: none;">
                     <div class="form-group">
                         <label>Local Path <span style="color: var(--text-secondary); font-size: 0.8rem;">(optional —
-                                only for single repo, leave blank to auto-clone from URL)</span></label>
-                        <input type="text" id="projPath" placeholder="/absolute/path/to/repo or leave blank">
+                                use a single repo path, or a parent folder to import every Git repository inside it)</span></label>
+                        <input type="text" id="projPath" placeholder="/absolute/path/to/repo-or-folder">
                     </div>
                 </div>
                 <div class="modal-actions">
@@ -411,7 +424,7 @@
         </div>
     </div>
 
-    <script src="script.js?v=20260414-60"></script>
+    <script src="script.js?v=20260414-62"></script>
 </body>
 
 </html>
