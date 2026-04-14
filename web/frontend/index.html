@@ -5,7 +5,7 @@
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>Community Smells Hub | Socio-Technical Analysis</title>
-    <link rel="stylesheet" href="style.css?v=20260309-4">
+    <link rel="stylesheet" href="style.css?v=20260323-52">
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700&display=swap" rel="stylesheet">
     <script src="https://unpkg.com/vis-network/standalone/umd/vis-network.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
@@ -18,11 +18,13 @@
     </div>
 
     <nav class="glass-nav">
-        <div class="logo">
+        <div id="homeLogo" class="logo" role="button" tabindex="0" aria-label="Go to home">
             <span class="accent-text">SMELL</span>HUB
         </div>
         <div class="nav-links">
             <button id="addProjectBtn" class="btn-primary">Add Project</button>
+            <button id="exportAllProjectsBtn" class="btn-secondary">Export All Analyzed CSV</button>
+            <button id="deleteAllProjectsBtn" class="btn-secondary" style="border-color: rgba(239, 68, 68, 0.55); color: #ef4444;">Delete All Projects</button>
         </div>
     </nav>
 
@@ -32,6 +34,95 @@
                 <h1>Projects Overview</h1>
                 <p>Monitor your community health and technical debt.</p>
             </header>
+            <div class="glass-card portfolio-role-card">
+                <div class="role-evolution-toolbar">
+                    <div>
+                        <h3>LLM Settings</h3>
+                        <p class="role-evolution-subtitle">Configure OpenAI and GitHub credentials directly from the UI for topic extraction, conflict detection, and discussion retrieval.</p>
+                    </div>
+                </div>
+                <div class="llm-settings-grid">
+                    <div class="form-group">
+                        <label for="llmApiKeyInput">OpenAI API Key</label>
+                        <input type="password" id="llmApiKeyInput" placeholder="sk-..." autocomplete="off">
+                        <small id="llmApiKeyHint" style="color: var(--text-secondary);">No key saved yet.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="githubTokenInput">GitHub Token</label>
+                        <input type="password" id="githubTokenInput" placeholder="ghp_... / github_pat_..." autocomplete="off">
+                        <small id="githubTokenHint" style="color: var(--text-secondary);">No GitHub token saved yet.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="llmModelInput">Model</label>
+                        <input type="text" id="llmModelInput" placeholder="gpt-5-mini">
+                    </div>
+                    <div class="form-group">
+                        <label for="llmRunsInput">LLM Runs</label>
+                        <input type="number" id="llmRunsInput" min="1" max="7" step="1" placeholder="1">
+                        <small style="color: var(--text-secondary);">The analyzer will run the LLM this many times, then use an LLM-as-a-judge pass to decide the final output.</small>
+                    </div>
+                    <div class="form-group">
+                        <label for="llmOrganizationInput">Organization (optional)</label>
+                        <input type="text" id="llmOrganizationInput" placeholder="org_...">
+                    </div>
+                    <div class="form-group">
+                        <label for="llmProjectInput">OpenAI Project ID (optional)</label>
+                        <input type="text" id="llmProjectInput" placeholder="proj_...">
+                        <small style="color: var(--text-secondary);">This is an OpenAI project identifier, not the repository URL to analyze.</small>
+                    </div>
+                    <div class="form-group llm-endpoint-field">
+                        <label for="llmEndpointInput">Endpoint</label>
+                        <input type="text" id="llmEndpointInput" placeholder="https://api.openai.com/v1/chat/completions">
+                    </div>
+                </div>
+                <div class="llm-settings-actions">
+                    <button id="saveLlmSettingsBtn" type="button" class="btn-primary">Save LLM Settings</button>
+                    <button id="clearLlmKeyBtn" type="button" class="btn-secondary">Clear Saved Keys</button>
+                </div>
+                <div id="llmSettingsStatus" class="topic-status-line">Loading current LLM settings...</div>
+            </div>
+            <div class="glass-card portfolio-role-card">
+                <div class="role-evolution-toolbar">
+                    <div>
+                        <h3>Portfolio Role Evolution</h3>
+                        <p class="role-evolution-subtitle">Track Software Engineering, AI/ML Engineering, and Hybrid activity across all analyzed projects.</p>
+                    </div>
+                    <div class="role-evolution-controls">
+                        <label for="globalRoleIntervalSelect">Window</label>
+                        <select id="globalRoleIntervalSelect">
+                            <option value="monthly">Monthly</option>
+                            <option value="quarterly" selected>Quarterly</option>
+                            <option value="yearly">Yearly</option>
+                        </select>
+                    </div>
+                </div>
+                <div class="role-charts-grid">
+                    <div class="chart-card">
+                        <h4>Role Distribution Over Time</h4>
+                        <canvas id="globalRoleDistributionChart"></canvas>
+                    </div>
+                    <div class="chart-card">
+                        <h4>Role Turnover Over Time</h4>
+                        <canvas id="globalRoleTurnoverChart"></canvas>
+                    </div>
+                </div>
+                <div class="role-turnover-table-shell">
+                    <table id="globalRoleTurnoverTable" class="overall-metrics-table"></table>
+                </div>
+            </div>
+            <div class="glass-card portfolio-role-card">
+                <div class="role-evolution-toolbar">
+                    <div>
+                        <h3>Portfolio Interaction Topics</h3>
+                        <p class="role-evolution-subtitle">LLM-assisted topic trees, developer-level topic profiles, and developer conflict analysis with empirical links to issues, pull requests, reviews, and commits across all projects. This aggregates only the projects for which you already ran the project-level LLM analysis.</p>
+                    </div>
+                    <div class="role-topic-actions">
+                        <button id="analyzeGlobalTopicsBtn" type="button" class="btn-primary">Run Global LLM Analysis</button>
+                    </div>
+                </div>
+                <div id="globalTopicsStatus" class="topic-status-line">Set <code>OPENAI_API_KEY</code> on the backend to enable topic extraction.</div>
+                <div id="globalTopicsTree" class="topic-tree-root"></div>
+            </div>
             <div id="projectGrid" class="project-grid">
                 <!-- Project cards will be injected here -->
                 <div class="loading-spinner"></div>
@@ -41,10 +132,18 @@
         <section id="projectDetailSection" class="hidden">
             <div style="display: flex; gap: 0.5rem; margin-bottom: 1rem;">
                 <button id="backBtn" type="button" class="btn-secondary">← Back to Projects</button>
+                <button id="prevProjectBtn" type="button" class="btn-secondary">← Previous Project</button>
+                <button id="nextProjectBtn" type="button" class="btn-secondary">Next Project →</button>
+                <span id="projectPositionLabel" style="align-self:center; color:#94a3b8; font-size:0.85rem;">Project 0/0</span>
                 <button id="exportCsvBtn" type="button" class="btn-primary">Export Current Window CSV</button>
                 <button id="exportCsvAllBtn" type="button" class="btn-secondary">Export Full History CSV</button>
                 <button id="reanalyzeBtn" type="button" class="btn-secondary">Re-analyze</button>
             </div>
+            <div class="detail-tabs">
+                <button id="snapshotTabBtn" type="button" class="tab-btn active">Snapshot View</button>
+                <button id="overallTabBtn" type="button" class="tab-btn">Overall Project Stats</button>
+            </div>
+            <div id="snapshotTabPanel" class="detail-tab-panel active">
             <div class="detail-container">
                 <div class="sidebar">
                     <div class="glass-card profile-card">
@@ -52,6 +151,9 @@
                         <span id="analysisStatus" class="status-badge">Analyzing...</span>
                         <div style="margin-top:0.6rem; font-size:0.85rem; color:#cbd5e1;">
                             ML Detector: <span id="mlDetectionStatus">Unknown</span>
+                        </div>
+                        <div id="analysisEta" style="margin-top:0.35rem; font-size:0.82rem; color:#94a3b8;">
+                            Progress: 0.0% | ETA: n/a
                         </div>
                         <div class="time-window-controls">
                             <div class="time-window-header">
@@ -150,6 +252,10 @@
                                 <canvas id="devRoleChart"></canvas>
                             </div>
                             <div class="chart-card">
+                                <h4>Abandonment By Role</h4>
+                                <canvas id="abandonedRoleChart"></canvas>
+                            </div>
+                            <div class="chart-card">
                                 <h4>Developer Sentiment Evolution</h4>
                                 <canvas id="devSentimentTimelineChart"></canvas>
                             </div>
@@ -182,6 +288,75 @@
                     </div>
                 </div>
             </div>
+            </div>
+            <div id="overallTabPanel" class="detail-tab-panel hidden">
+                <div class="glass-card" style="margin-bottom: 1rem;">
+                    <h3>Socio-Technical Network (Overall)</h3>
+                    <div id="overallNetworkGraph"></div>
+                </div>
+                <div class="glass-card" style="margin-bottom: 1rem;">
+                    <div class="role-evolution-toolbar">
+                        <div>
+                            <h3>Role Evolution</h3>
+                            <p class="role-evolution-subtitle">Distribution and role changes over time for this project.</p>
+                        </div>
+                        <div class="role-evolution-controls">
+                            <label for="projectRoleIntervalSelect">Window</label>
+                            <select id="projectRoleIntervalSelect">
+                                <option value="monthly">Monthly</option>
+                                <option value="quarterly" selected>Quarterly</option>
+                                <option value="yearly">Yearly</option>
+                            </select>
+                        </div>
+                    </div>
+                    <div class="role-charts-grid">
+                        <div class="chart-card">
+                            <h4>Role Distribution Over Time</h4>
+                            <canvas id="projectRoleDistributionChart"></canvas>
+                        </div>
+                        <div class="chart-card">
+                            <h4>Role Turnover Over Time</h4>
+                            <canvas id="projectRoleTurnoverChart"></canvas>
+                        </div>
+                    </div>
+                    <div class="role-turnover-table-shell">
+                        <table id="projectRoleTurnoverTable" class="overall-metrics-table"></table>
+                    </div>
+                </div>
+                <div class="glass-card" style="margin-bottom: 1rem;">
+                    <div class="role-evolution-toolbar">
+                        <div>
+                            <h3>Interaction Topics</h3>
+                            <p class="role-evolution-subtitle">Topic trees, developer-level topic profiles, and conflict analysis for discussions and commit messages produced by Software Engineering, AI/ML, and Hybrid contributors in this project. This analysis runs independently from the full project analysis and prepares the data later reused by Global LLM Analysis.</p>
+                        </div>
+                        <div class="role-topic-actions">
+                            <button id="analyzeProjectTopicsBtn" type="button" class="btn-primary">Run Project LLM Analysis</button>
+                        </div>
+                    </div>
+                    <div id="projectTopicsStatus" class="topic-status-line">Set <code>OPENAI_API_KEY</code> on the backend to enable topic extraction.</div>
+                    <div id="projectTopicsTree" class="topic-tree-root"></div>
+                </div>
+                <div class="glass-card">
+                    <h3>Overall Project Stats (Time Evolution)</h3>
+                    <div style="display:flex; gap:0.7rem; align-items:center; margin-bottom:0.8rem; flex-wrap:wrap;">
+                        <label for="overallMetricSelect" style="font-size:0.85rem; color:#cbd5e1;">Metric:</label>
+                        <select id="overallMetricSelect" style="min-width:260px;"></select>
+                    </div>
+                    <canvas id="overallMetricTrendChart"></canvas>
+                </div>
+                <div class="glass-card" style="margin-top: 1rem;">
+                    <h3>All Metrics By Time Window</h3>
+                    <div style="overflow-x:auto;">
+                        <table id="overallMetricsTimelineTable" class="overall-metrics-table"></table>
+                    </div>
+                </div>
+                <div class="glass-card" style="margin-top: 1rem;">
+                    <h3>Developer Summary (Overall)</h3>
+                    <div style="overflow-x:auto;">
+                        <table id="overallDevelopersSummaryTable" class="overall-metrics-table"></table>
+                    </div>
+                </div>
+            </div>
         </section>
     </main>
 
@@ -198,6 +373,19 @@
                     <label>Repository URLs</label>
                     <textarea id="projUrls" required placeholder="https://github.com/org/repo-1.git&#10;https://github.com/org/repo-2.git"></textarea>
                     <small style="color: var(--text-secondary);">One URL per line (you can also separate with commas).</small>
+                    <div style="display:flex; gap:0.5rem; align-items:center; margin-top:0.6rem;">
+                        <button id="prevRepoInListBtn" type="button" class="btn-secondary">← Previous</button>
+                        <button id="nextRepoInListBtn" type="button" class="btn-secondary">Next →</button>
+                        <span id="repoListPositionLabel" style="color:#94a3b8; font-size:0.82rem;">Repo 0/0</span>
+                    </div>
+                    <div id="repoListCurrentValue" style="margin-top:0.45rem; color:#cbd5e1; font-size:0.82rem; word-break:break-all;">
+                        Current: n/a
+                    </div>
+                </div>
+                <div class="form-group">
+                    <label>Or Import from CSV</label>
+                    <input type="file" id="projCsvFile" accept=".csv,text/csv">
+                    <small style="color: var(--text-secondary);">Columns supported: <code>url</code>, <code>name</code>, <code>local_path</code> (or aliases: <code>repo_url</code>, <code>repository_url</code>, <code>git_url</code>, <code>project_name</code>, <code>path</code>, <code>repo_path</code>).</small>
                 </div>
                 <div style="margin-bottom: 1rem; text-align: right;">
                     <a href="#" id="toggleAdvanced"
@@ -213,13 +401,17 @@
                 </div>
                 <div class="modal-actions">
                     <button type="button" id="closeModal" class="btn-secondary">Cancel</button>
-                    <button type="submit" class="btn-primary">Add & Analyze</button>
+                    <button type="button" id="importCsvBtn" class="btn-secondary">Import CSV & Auto Analysis</button>
+                    <button type="button" id="importCsvAnalyzeBtn" class="btn-secondary">Import CSV & Full Analysis</button>
+                    <button type="button" id="addProjectAnalyzeBtn" class="btn-secondary">Add & Full Analysis</button>
+                    <button type="submit" class="btn-primary">Add Project & Auto Analysis</button>
                 </div>
+                <div id="bulkImportStatus" style="margin-top:0.7rem; font-size:0.82rem; color:#94a3b8; min-height:1.1rem;"></div>
             </form>
         </div>
     </div>
 
-    <script src="script.js?v=20260311-13"></script>
+    <script src="script.js?v=20260414-60"></script>
 </body>
 
 </html>

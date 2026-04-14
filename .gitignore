@@ -1,0 +1,23 @@
+# macOS
+.DS_Store
+
+# Python cache / build artifacts
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Virtual environments
+.venv/
+venv/
+
+# Local/runtime data (do not version projects or machine-specific state)
+data/projects/
+data/projects.json
+data/topic_documents/
+data/llm_settings.json
+
+# Build outputs / bundles
+build/
+dist/
+*.zip

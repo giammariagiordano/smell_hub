@@ -1,8 +1,10 @@
-from fastapi import FastAPI, HTTPException, BackgroundTasks
+from fastapi import FastAPI, HTTPException, BackgroundTasks, UploadFile, File, Form
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.staticfiles import StaticFiles
 from fastapi.responses import Response
 from typing import List, Dict, Optional, Tuple, Any
+from concurrent.futures import ThreadPoolExecutor, as_completed, Future
+import threading
 import os
 import uuid
 import shutil
@@ -24,6 +26,13 @@ PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
     sys.path.append(PROJECT_ROOT)
 
+IS_FROZEN = bool(getattr(sys, "frozen", False))
+_BUNDLE_ROOT = getattr(sys, "_MEIPASS", PROJECT_ROOT) if IS_FROZEN else PROJECT_ROOT
+RESOURCE_ROOT = os.path.abspath(os.environ.get("SMELLHUB_RESOURCE_ROOT", _BUNDLE_ROOT))
+_DEFAULT_DATA_ROOT = os.path.join(os.path.expanduser("~"), ".smellhub") if IS_FROZEN else os.path.join(PROJECT_ROOT, "data")
+DATA_ROOT = os.path.abspath(os.environ.get("SMELLHUB_DATA_DIR", _DEFAULT_DATA_ROOT))
+PROJECTS_ROOT = os.path.join(DATA_ROOT, "projects")
+
 from models.schemas import (
     Project,
     ProjectMetrics,
@@ -32,6 +41,16 @@ from models.schemas import (
     Developer,
     Commit,
     VulnerabilityInstance,
+    TopicModelingResult,
+    RoleTopicTree,
+    DeveloperTopicProfile,
+    DeveloperConflictRecord,
+    PotentialConflictThread,
+    TopicNode,
+    TopicSubtopic,
+    TraceabilityLink,
+    LLMSettingsResponse,
+    LLMSettingsUpdateRequest,
 )
 from core.miner import RepositoryMiner
 from core.network_builder import NetworkBuilder
@@ -43,6 +62,7 @@ from analyzers.traditional_smells import TraditionalSmellAnalyzer
 from analyzers.rszz import RSZZAnalyzer
 from analyzers.vulnerabilities import BanditVulnerabilityAnalyzer
 from analyzers.developer_sentiment import DeveloperSentimentAnalyzer
+from analyzers.role_topic_modeling import RoleTopicModelingAnalyzer
 
 app = FastAPI(title="Community Smells Hub API")
 
@@ -55,11 +75,22 @@ app.add_middleware(
 
 import json
 
-PROJECTS_FILE = os.path.join(PROJECT_ROOT, "data", "projects.json")
+PROJECTS_FILE = os.path.join(DATA_ROOT, "projects.json")
+TOPIC_DOCS_ROOT = os.path.join(DATA_ROOT, "topic_documents")
+LLM_SETTINGS_FILE = os.path.join(DATA_ROOT, "llm_settings.json")
 os.makedirs(os.path.dirname(PROJECTS_FILE), exist_ok=True)
+os.makedirs(PROJECTS_ROOT, exist_ok=True)
+os.makedirs(TOPIC_DOCS_ROOT, exist_ok=True)
+_PROJECTS_IO_LOCK = threading.RLock()
+_PROJECTS_DB_LOCK = threading.RLock()
+_TOPIC_DOCS_LOCK = threading.RLock()
+_LLM_SETTINGS_LOCK = threading.RLock()
+_GLOBAL_TOPICS_CACHE = TopicModelingResult()
+_GLOBAL_TOPICS_LOCK = threading.RLock()
 
 _PRONOUN_FILE_CANDIDATES = [
     os.environ.get("PRONOUN_PARADIGMS_FILE", "").strip(),
+    os.path.join(RESOURCE_ROOT, "pronoun_paradigms_coling2022.txt"),
     os.path.join(os.path.dirname(PROJECT_ROOT), "community_smells", "pronoun_paradigms_coling2022.txt"),
     "/Users/broke31/Desktop/community_smells/pronoun_paradigms_coling2022.txt",
 ]
@@ -94,25 +125,414 @@ def load_projects() -> Dict[str, Project]:
 
 def save_projects(db: Dict[str, Project]):
     try:
-        with open(PROJECTS_FILE, "w") as f:
-            data = {k: v.model_dump(mode='json') for k, v in db.items()}
-            json.dump(data, f, indent=4)
+        with _PROJECTS_IO_LOCK:
+            with open(PROJECTS_FILE, "w") as f:
+                data = {k: v.model_dump(mode='json') for k, v in db.items()}
+                json.dump(data, f, indent=4)
     except Exception as e:
         print(f"Error saving projects: {e}")
+
+
+def _mask_api_key(value: str) -> str:
+    raw = str(value or "").strip()
+    if len(raw) <= 8:
+        return "*" * len(raw)
+    return f"{raw[:4]}...{raw[-4:]}"
+
+
+def _load_llm_settings_raw() -> Dict[str, Any]:
+    if not os.path.exists(LLM_SETTINGS_FILE):
+        return {}
+    try:
+        with _LLM_SETTINGS_LOCK:
+            with open(LLM_SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_llm_settings_raw(data: Dict[str, Any]) -> None:
+    payload = dict(data or {})
+    with _LLM_SETTINGS_LOCK:
+        with open(LLM_SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
+
+
+def _effective_llm_config() -> Dict[str, Any]:
+    stored = _load_llm_settings_raw()
+    llm_runs_raw = stored.get("llm_runs")
+    try:
+        llm_runs = int(llm_runs_raw if llm_runs_raw is not None else os.environ.get("SMELLHUB_TOPIC_RUNS", "1"))
+    except Exception:
+        llm_runs = 1
+    llm_runs = max(1, min(7, llm_runs))
+    return {
+        "api_key": str(stored.get("api_key") or "").strip() or os.environ.get("OPENAI_API_KEY", "").strip() or os.environ.get("SMELLHUB_OPENAI_API_KEY", "").strip(),
+        "model": str(stored.get("model") or "").strip() or os.environ.get("SMELLHUB_TOPIC_MODEL", "gpt-5-mini").strip(),
+        "llm_runs": llm_runs,
+        "organization": str(stored.get("organization") or "").strip() or os.environ.get("OPENAI_ORGANIZATION", "").strip(),
+        "project": str(stored.get("project") or "").strip() or os.environ.get("OPENAI_PROJECT", "").strip(),
+        "endpoint": str(stored.get("endpoint") or "").strip() or os.environ.get("SMELLHUB_OPENAI_CHAT_ENDPOINT", "https://api.openai.com/v1/chat/completions").strip(),
+    }
+
+
+def _effective_github_token() -> str:
+    stored = _load_llm_settings_raw()
+    return (
+        str(stored.get("github_token") or "").strip()
+        or os.environ.get("GITHUB_TOKEN", "").strip()
+    )
+
+
+def _build_llm_settings_response() -> LLMSettingsResponse:
+    config = _effective_llm_config()
+    api_key = str(config.get("api_key") or "").strip()
+    github_token = _effective_github_token()
+    return LLMSettingsResponse(
+        provider="OpenAI",
+        model=str(config.get("model") or "gpt-5-mini"),
+        llm_runs=max(1, int(config.get("llm_runs") or 1)),
+        organization=str(config.get("organization") or ""),
+        project=str(config.get("project") or ""),
+        endpoint=str(config.get("endpoint") or "https://api.openai.com/v1/chat/completions"),
+        has_api_key=bool(api_key),
+        api_key_masked=_mask_api_key(api_key) if api_key else "",
+        has_github_token=bool(github_token),
+        github_token_masked=_mask_api_key(github_token) if github_token else "",
+    )
+
+
+def _topic_docs_path(project_id: str) -> str:
+    safe_id = re.sub(r"[^a-zA-Z0-9._-]+", "_", str(project_id or "").strip()) or "project"
+    return os.path.join(TOPIC_DOCS_ROOT, f"{safe_id}.json")
+
+
+def _save_topic_documents(project_id: str, documents: List[Dict[str, Any]]) -> None:
+    path = _topic_docs_path(project_id)
+    payload = list(documents or [])
+    with _TOPIC_DOCS_LOCK:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(payload, f, indent=2, ensure_ascii=True)
+
+
+def _load_topic_documents(project_id: str) -> List[Dict[str, Any]]:
+    path = _topic_docs_path(project_id)
+    if not os.path.exists(path):
+        return []
+    try:
+        with _TOPIC_DOCS_LOCK:
+            with open(path, "r", encoding="utf-8") as f:
+                raw = json.load(f)
+        return raw if isinstance(raw, list) else []
+    except Exception:
+        return []
+
+
+def _delete_topic_documents(project_id: str) -> None:
+    path = _topic_docs_path(project_id)
+    if not os.path.exists(path):
+        return
+    try:
+        with _TOPIC_DOCS_LOCK:
+            os.remove(path)
+    except Exception:
+        pass
+
+
+def _invalidate_global_topics_cache() -> None:
+    global _GLOBAL_TOPICS_CACHE
+    with _GLOBAL_TOPICS_LOCK:
+        _GLOBAL_TOPICS_CACHE = TopicModelingResult()
+
+
+def _collect_llm_only_documents(project: Project) -> List[Dict[str, Any]]:
+    _ensure_project_repo_available(project)
+    miner = RepositoryMiner(project.local_path)
+    commits = sorted(miner.list_commits(), key=lambda c: c.date)
+    now = datetime.now()
+    if commits:
+        project_start = commits[0].date
+        # For standalone LLM analysis we want the full current discussion history,
+        # not only threads updated before the last commit in the local clone.
+        project_end = now + timedelta(seconds=1)
+    else:
+        project_start = now - timedelta(days=365)
+        project_end = now + timedelta(seconds=1)
+
+    all_developers = miner.get_developers()
+    login_to_dev_id = _build_login_to_dev_id_map(all_developers)
+    login_to_dev_id = _augment_login_to_dev_id_map_with_github_contributors(project.url, all_developers, login_to_dev_id)
+    gh_text_signals_all = _fetch_github_issue_pr_text_signals(
+        project.url,
+        project_start,
+        project_end,
+        login_to_dev_id,
+    )
+    gh_text_by_dev: Dict[str, List[str]] = {}
+    for signal in gh_text_signals_all:
+        if not isinstance(signal, dict):
+            continue
+        dev_id = str(signal.get("developer_id") or "").strip()
+        txt = str(signal.get("text") or "").strip()
+        if dev_id and txt:
+            gh_text_by_dev.setdefault(dev_id, []).append(txt)
+
+    classifier = DeveloperClassifier()
+    classifier.classify_developers(
+        all_developers,
+        commits,
+        repo_root=project.local_path,
+        gh_text_by_dev=gh_text_by_dev,
+    )
+    dev_by_id = {dev.id: dev for dev in all_developers if dev.id}
+    repo_web_base = _github_repo_web_base(project.url)
+    window_meta = {
+        "id": "all_history",
+        "label": "All History",
+    }
+
+    documents: List[Dict[str, Any]] = []
+    for commit in commits:
+        if not commit.author_id or not commit.message:
+            continue
+        dev = dev_by_id.get(commit.author_id)
+        role = dev.classification if dev else "Unknown"
+        doc = _build_interaction_document(
+            project=project,
+            window_meta=window_meta,
+            source_type="commit_message",
+            developer_id=commit.author_id,
+            role=role,
+            text=commit.message,
+            timestamp=commit.date,
+            source_id=f"commit:{commit.hash}",
+            source_label=f"Commit {str(commit.hash or '')[:7]}",
+            source_url=f"{repo_web_base}/commit/{commit.hash}" if repo_web_base and commit.hash else "",
+            is_open=False,
+            thread_id=f"commit:{commit.hash}",
+            thread_label=f"Commit {str(commit.hash or '')[:7]}",
+            thread_url=f"{repo_web_base}/commit/{commit.hash}" if repo_web_base and commit.hash else "",
+            thread_is_open=False,
+        )
+        if doc:
+            documents.append(doc)
+
+    for signal in gh_text_signals_all:
+        if not isinstance(signal, dict):
+            continue
+        dev_id = str(signal.get("developer_id") or "").strip()
+        if not dev_id:
+            continue
+        dev = dev_by_id.get(dev_id)
+        role = dev.classification if dev else "Unknown"
+        doc = _build_interaction_document(
+            project=project,
+            window_meta=window_meta,
+            source_type=str(signal.get("source_type") or "issue_pr"),
+            developer_id=dev_id,
+            role=role,
+            text=str(signal.get("text") or ""),
+            timestamp=signal.get("timestamp"),
+            source_id=str(signal.get("source_id") or ""),
+            source_label=str(signal.get("source_label") or ""),
+            source_url=str(signal.get("source_url") or ""),
+            is_open=bool(signal.get("is_open")),
+            thread_id=str(signal.get("thread_id") or ""),
+            thread_label=str(signal.get("thread_label") or ""),
+            thread_url=str(signal.get("thread_url") or ""),
+            thread_is_open=bool(signal.get("thread_is_open")),
+        )
+        if doc:
+            documents.append(doc)
+
+    _save_topic_documents(project.id, documents)
+    return documents
+
+
+def _build_interaction_document(
+    project: Project,
+    window_meta: Dict[str, Any],
+    source_type: str,
+    developer_id: str,
+    role: str,
+    text: str,
+    timestamp: Optional[datetime],
+    source_id: str = "",
+    source_label: str = "",
+    source_url: str = "",
+    is_open: bool = False,
+    thread_id: str = "",
+    thread_label: str = "",
+    thread_url: str = "",
+    thread_is_open: bool = False,
+) -> Optional[Dict[str, Any]]:
+    content = re.sub(r"\s+", " ", str(text or "")).strip()
+    if not content:
+        return None
+    source_kind = str(source_type or "").strip() or "unknown"
+    final_source_id = str(source_id or "").strip()
+    if not final_source_id:
+        timestamp_label = timestamp.isoformat() if isinstance(timestamp, datetime) else "na"
+        final_source_id = f"{source_kind}:{developer_id}:{window_meta.get('id') or 'window'}:{timestamp_label}"
+    final_source_label = str(source_label or "").strip() or final_source_id
+    final_thread_id = str(thread_id or "").strip() or final_source_id
+    final_thread_label = str(thread_label or "").strip() or final_source_label
+    return {
+        "project_id": project.id,
+        "project_name": project.name,
+        "time_window_id": str(window_meta.get("id") or ""),
+        "time_window_label": str(window_meta.get("label") or ""),
+        "source_id": final_source_id,
+        "source_label": final_source_label,
+        "source_url": str(source_url or "").strip(),
+        "source_type": source_kind,
+        "is_open": bool(is_open),
+        "thread_id": final_thread_id,
+        "thread_label": final_thread_label,
+        "thread_url": str(thread_url or source_url or "").strip(),
+        "thread_is_open": bool(thread_is_open),
+        "developer_id": str(developer_id or "").strip(),
+        "role": str(role or "Unknown"),
+        "text": content[:500],
+        "timestamp": timestamp.isoformat() if isinstance(timestamp, datetime) else "",
+    }
 
 
 projects_db: Dict[str, Project] = load_projects()
 
 _stale_running_fixed = False
+_legacy_progress_fixed = False
+_STARTUP_RESUME_PROJECT_IDS: List[str] = []
 for _p in projects_db.values():
-    if _p.analysis_status == "Running":
-        _p.analysis_status = "Interrupted (restart required)"
-        _p.ml_detection_status = "Interrupted by server restart"
-        if not _p.ml_detection_error:
-            _p.ml_detection_error = "Previous background analysis stopped after backend restart."
+    if _p.analysis_status in {"Running", "Queued", "Queued for automatic resume"}:
+        _p.analysis_status = "Queued for automatic resume"
+        _p.analysis_eta_seconds = None
+        _p.ml_detection_status = "Interrupted by server restart; automatic resume queued."
+        _STARTUP_RESUME_PROJECT_IDS.append(_p.id)
         _stale_running_fixed = True
-if _stale_running_fixed:
+    elif _p.analysis_status == "Completed":
+        if float(_p.analysis_progress_pct or 0.0) <= 0.0:
+            _p.analysis_progress_pct = 100.0
+            _legacy_progress_fixed = True
+        if _p.analysis_eta_seconds is None:
+            _p.analysis_eta_seconds = 0
+            _legacy_progress_fixed = True
+if _stale_running_fixed or _legacy_progress_fixed:
     save_projects(projects_db)
+
+
+def _machine_cpu_count() -> int:
+    try:
+        return max(1, int(os.cpu_count() or 1))
+    except Exception:
+        return 1
+
+
+def _adaptive_analysis_parallelism() -> int:
+    # Full analysis is heavy (mining + smell analysis + model work), so we keep
+    # a conservative default based on CPU cores and leave one core free.
+    cpu = _machine_cpu_count()
+    return max(1, min(8, max(1, cpu - 1)))
+
+
+def _adaptive_import_parallelism() -> int:
+    # Import/clone is mostly I/O bound, so we can be a bit more aggressive.
+    cpu = _machine_cpu_count()
+    return max(2, min(24, cpu * 2))
+
+
+def _read_parallelism_env(name: str, default_value: int) -> int:
+    raw = str(os.environ.get(name, "") or "").strip()
+    if not raw:
+        return int(default_value)
+    try:
+        return max(1, int(raw))
+    except Exception:
+        return int(default_value)
+
+
+_ANALYSIS_MAX_WORKERS = _read_parallelism_env("ANALYSIS_PARALLELISM", _adaptive_analysis_parallelism())
+_ANALYSIS_EXECUTOR = ThreadPoolExecutor(max_workers=_ANALYSIS_MAX_WORKERS)
+_RUNNING_ANALYSES: set = set()
+_RUNNING_ANALYSES_LOCK = threading.Lock()
+_ANALYSIS_FUTURES: Dict[str, Future] = {}
+_WORKFLOW_GENERATION = 0
+_WORKFLOW_GENERATION_LOCK = threading.Lock()
+
+
+class AnalysisCancelled(Exception):
+    pass
+
+
+def _get_workflow_generation() -> int:
+    with _WORKFLOW_GENERATION_LOCK:
+        return int(_WORKFLOW_GENERATION)
+
+
+def _bump_workflow_generation() -> int:
+    global _WORKFLOW_GENERATION
+    with _WORKFLOW_GENERATION_LOCK:
+        _WORKFLOW_GENERATION += 1
+        return int(_WORKFLOW_GENERATION)
+
+
+def _is_generation_cancelled(expected_generation: Optional[int]) -> bool:
+    if expected_generation is None:
+        return False
+    return int(expected_generation) != _get_workflow_generation()
+
+
+def _analysis_worker(project_id: str, generation: int) -> None:
+    try:
+        project = projects_db.get(project_id)
+        if project:
+            project.analysis_status = "Running"
+            if float(project.analysis_progress_pct or 0.0) <= 0.0:
+                _set_analysis_progress(project, 0.0, None, 0, 0)
+            if not str(project.ml_detection_status or "").strip() or "queued" in str(project.ml_detection_status or "").lower():
+                project.ml_detection_status = "Running analysis workers..."
+            save_projects(projects_db)
+        run_full_analysis(project_id, expected_generation=generation)
+    finally:
+        with _RUNNING_ANALYSES_LOCK:
+            _RUNNING_ANALYSES.discard(project_id)
+            _ANALYSIS_FUTURES.pop(project_id, None)
+
+
+def _enqueue_analysis(project_id: str, generation: Optional[int] = None) -> bool:
+    gen = _get_workflow_generation() if generation is None else int(generation)
+    if _is_generation_cancelled(gen):
+        return False
+    with _RUNNING_ANALYSES_LOCK:
+        if project_id in _RUNNING_ANALYSES:
+            return False
+        _RUNNING_ANALYSES.add(project_id)
+        fut = _ANALYSIS_EXECUTOR.submit(_analysis_worker, project_id, gen)
+        _ANALYSIS_FUTURES[project_id] = fut
+    return True
+
+
+def _resume_queued_analyses_after_restart() -> None:
+    if not _STARTUP_RESUME_PROJECT_IDS:
+        return
+    generation = _get_workflow_generation()
+    touched = False
+    for project_id in list(dict.fromkeys(_STARTUP_RESUME_PROJECT_IDS)):
+        project = projects_db.get(project_id)
+        if not project:
+            continue
+        project.analysis_status = "Queued for automatic resume"
+        if not str(project.ml_detection_status or "").strip():
+            project.ml_detection_status = "Resuming after backend restart..."
+        project.analysis_eta_seconds = None
+        queued = _enqueue_analysis(project_id, generation=generation)
+        touched = touched or queued
+    if touched:
+        save_projects(projects_db)
+
+
+_resume_queued_analyses_after_restart()
 
 
 def _start_of_month(dt: datetime) -> datetime:
@@ -207,11 +627,12 @@ def _load_pronoun_sets() -> Dict[str, set]:
     return pronouns
 
 
-def _build_three_month_windows(commits: List[Commit]) -> List[Dict[str, object]]:
+def _build_time_windows(commits: List[Commit], months_per_window: int = 1) -> List[Dict[str, object]]:
+    months_per_window = max(1, int(months_per_window or 1))
     if not commits:
         now = datetime.now()
         s = _start_of_month(now)
-        e = _add_months(s, 3)
+        e = _add_months(s, months_per_window)
         return [{
             "id": _window_id(s, e),
             "label": _window_label(s, e),
@@ -226,7 +647,7 @@ def _build_three_month_windows(commits: List[Commit]) -> List[Dict[str, object]]
 
     windows = []
     while cursor <= max_date:
-        nxt = _add_months(cursor, 3)
+        nxt = _add_months(cursor, months_per_window)
         windows.append({
             "id": _window_id(cursor, nxt),
             "label": _window_label(cursor, nxt),
@@ -302,7 +723,89 @@ def _clone_developer_identity(dev: Developer) -> Developer:
         sentiment_label=dev.sentiment_label or "Unknown",
         sentiment_messages_count=int(dev.sentiment_messages_count or 0),
         sentiment_emotions=dict(dev.sentiment_emotions or {}),
+        abandoned_since_date=dev.abandoned_since_date,
+        last_commit_hash=dev.last_commit_hash,
+        last_commit_date=dev.last_commit_date,
+        last_commit_message=dev.last_commit_message,
+        last_message_before_abandonment_hash=dev.last_message_before_abandonment_hash,
+        last_message_before_abandonment_date=dev.last_message_before_abandonment_date,
+        last_message_before_abandonment=dev.last_message_before_abandonment,
     )
+
+
+def _clone_developer_for_export(dev: Developer, *, zero_window_metrics: bool = False) -> Developer:
+    if hasattr(dev, "model_dump"):
+        payload = dev.model_dump(mode="python")
+    elif hasattr(dev, "dict"):
+        payload = dev.dict()
+    else:
+        payload = dict(dev)
+    cloned = Developer(**payload)
+    if zero_window_metrics:
+        cloned.community_smells = []
+        cloned.ml_smells = []
+        cloned.ml_smell_details = []
+        cloned.traditional_smells = []
+        cloned.traditional_smell_details = []
+        cloned.vulnerabilities = []
+        cloned.vulnerability_details = []
+        cloned.bug_introduced_count = 0
+        cloned.commits_count = 0
+        cloned.bug_fix_commits_count = 0
+        cloned.files_touched_count = 0
+        cloned.lines_added = 0
+        cloned.lines_deleted = 0
+        cloned.code_churn = 0
+        cloned.avg_files_per_commit = 0.0
+        cloned.sentiment_score = 0.0
+        cloned.sentiment_label = "Unknown"
+        cloned.sentiment_messages_count = 0
+        cloned.sentiment_emotions = {}
+    return cloned
+
+
+def _window_export_developers(project: Project, window_idx: Optional[int], active_developers: List[Developer]) -> List[Developer]:
+    if window_idx is None or not (project.time_windows or []):
+        return list(active_developers or [])
+
+    time_windows = list(project.time_windows or [])
+    active_map = {dev.id: dev for dev in (active_developers or []) if getattr(dev, "id", None)}
+    history_by_dev: Dict[str, List[Tuple[int, Developer]]] = {}
+    for idx, tw in enumerate(time_windows[: window_idx + 1]):
+        for dev in (tw.developers or []):
+            if not dev.id:
+                continue
+            history_by_dev.setdefault(dev.id, []).append((idx, dev))
+
+    export_devs: List[Developer] = [dev for dev in (active_developers or [])]
+    for dev_id, history in history_by_dev.items():
+        if dev_id in active_map:
+            continue
+        last_idx, last_dev = history[-1]
+        cloned = _clone_developer_for_export(last_dev, zero_window_metrics=True)
+        cloned.last_interaction_window_id = time_windows[last_idx].id
+        cloned.last_interaction_window_label = time_windows[last_idx].label
+        cloned.is_abandoned = bool(last_idx < window_idx)
+        cloned.abandonment_status = "Abandoned" if cloned.is_abandoned else "Active"
+        if cloned.is_abandoned:
+            abandon_idx = min(last_idx + 1, window_idx)
+            cloned.abandoned_since_window_id = time_windows[abandon_idx].id
+            cloned.abandoned_since_window_label = time_windows[abandon_idx].label
+            cloned.abandoned_since_date = time_windows[abandon_idx].start_date
+            cloned.last_message_before_abandonment_hash = cloned.last_commit_hash
+            cloned.last_message_before_abandonment_date = cloned.last_commit_date
+            cloned.last_message_before_abandonment = cloned.last_commit_message
+        else:
+            cloned.abandoned_since_window_id = None
+            cloned.abandoned_since_window_label = None
+            cloned.abandoned_since_date = None
+            cloned.last_message_before_abandonment_hash = None
+            cloned.last_message_before_abandonment_date = None
+            cloned.last_message_before_abandonment = None
+        export_devs.append(cloned)
+
+    export_devs.sort(key=lambda d: (not bool(getattr(d, "is_abandoned", False)), -(getattr(d, "commits_count", 0) or 0), d.id))
+    return export_devs
 
 
 def _normalize_identity_text(value: str) -> str:
@@ -321,6 +824,13 @@ def _parse_github_owner_repo(url: str) -> Tuple[Optional[str], Optional[str]]:
     return None, None
 
 
+def _github_repo_web_base(url: str) -> str:
+    owner, repo = _parse_github_owner_repo(url)
+    if not owner or not repo:
+        return ""
+    return f"https://github.com/{owner}/{repo}"
+
+
 def _extract_login_from_noreply(email: str) -> Optional[str]:
     if not email:
         return None
@@ -329,6 +839,104 @@ def _extract_login_from_noreply(email: str) -> Optional[str]:
     if m:
         return m.group(1)
     return None
+
+
+def _developer_identity_norm_tokens(dev: Developer) -> set:
+    tokens = set()
+    for alias in (dev.aliases or []):
+        norm = _normalize_identity_text(alias)
+        if norm:
+            tokens.add(norm)
+    emails = list(dev.emails or [])
+    if "@" in str(dev.id or ""):
+        emails.append(str(dev.id or ""))
+    for email in emails:
+        local = str(email or "").split("@", 1)[0].split("+")[-1]
+        norm = _normalize_identity_text(local)
+        if norm:
+            tokens.add(norm)
+        login = _extract_login_from_noreply(str(email or ""))
+        if login:
+            login_norm = _normalize_identity_text(login)
+            if login_norm:
+                tokens.add(login_norm)
+    return tokens
+
+
+def _resolve_dev_id_from_login(login: str, login_to_dev_id: Dict[str, str]) -> Optional[str]:
+    raw = str(login or "").strip().lower()
+    if not raw:
+        return None
+    direct = login_to_dev_id.get(raw)
+    if direct:
+        return direct
+    normalized = _normalize_identity_text(raw)
+    if normalized:
+        return login_to_dev_id.get(f"norm:{normalized}") or login_to_dev_id.get(normalized)
+    return None
+
+
+def _augment_login_to_dev_id_map_with_github_contributors(
+    project_url: str,
+    developers: List[Developer],
+    mapping: Dict[str, str],
+) -> Dict[str, str]:
+    owner, repo = _parse_github_owner_repo(project_url)
+    if not owner or not repo or not developers:
+        return mapping
+
+    token = _effective_github_token()
+    timeout_sec = 6
+    contributor_logins: List[str] = []
+
+    def gh_get(url: str) -> Optional[Any]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "community-smells-hub",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = Request(url, headers=headers, method="GET")
+        try:
+            with urlopen(req, timeout=timeout_sec) as response:
+                if int(response.status) != 200:
+                    return None
+                return json.loads(response.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return None
+
+    for page in range(1, 4):
+        payload = gh_get(
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/contributors?per_page=100&page={page}"
+        )
+        if not isinstance(payload, list) or not payload:
+            break
+        for item in payload:
+            if not isinstance(item, dict):
+                continue
+            login = str(item.get("login") or "").strip().lower()
+            if login and login not in contributor_logins:
+                contributor_logins.append(login)
+
+    if not contributor_logins:
+        return mapping
+
+    norm_to_dev_ids: Dict[str, set] = {}
+    for dev in developers:
+        for token_norm in _developer_identity_norm_tokens(dev):
+            norm_to_dev_ids.setdefault(token_norm, set()).add(dev.id)
+
+    for login in contributor_logins:
+        if login in mapping:
+            continue
+        norm = _normalize_identity_text(login)
+        if not norm:
+            continue
+        dev_ids = norm_to_dev_ids.get(norm) or set()
+        if len(dev_ids) == 1:
+            mapping[login] = next(iter(dev_ids))
+
+    return mapping
 
 
 def _parse_github_datetime(value: Optional[str]) -> Optional[datetime]:
@@ -343,13 +951,18 @@ def _parse_github_datetime(value: Optional[str]) -> Optional[datetime]:
 
 def _build_login_to_dev_id_map(developers: List[Developer]) -> Dict[str, str]:
     mapping: Dict[str, str] = {}
+    normalized_candidates: Dict[str, set] = {}
     for dev in developers:
         aliases_norm = {_normalize_identity_text(a) for a in (dev.aliases or []) if a}
         for email in dev.emails or []:
             login = _extract_login_from_noreply(email)
             if login:
                 mapping[login.lower()] = dev.id
+                normalized_candidates.setdefault(_normalize_identity_text(login), set()).add(dev.id)
             local = (email or "").split("@", 1)[0].split("+")[-1].strip().lower()
+            local_norm = _normalize_identity_text(local)
+            if local_norm:
+                normalized_candidates.setdefault(local_norm, set()).add(dev.id)
             if local and re.match(r"^[a-z0-9-]{1,39}$", local):
                 if _normalize_identity_text(local) in aliases_norm:
                     mapping[local] = dev.id
@@ -357,6 +970,17 @@ def _build_login_to_dev_id_map(developers: List[Developer]) -> Dict[str, str]:
             alias_s = (alias or "").strip().lower()
             if alias_s and re.match(r"^[a-z0-9-]{1,39}$", alias_s):
                 mapping.setdefault(alias_s, dev.id)
+            alias_norm = _normalize_identity_text(alias_s)
+            if alias_norm:
+                normalized_candidates.setdefault(alias_norm, set()).add(dev.id)
+        if "@" in str(dev.id or ""):
+            id_local = str(dev.id).split("@", 1)[0].split("+")[-1].strip().lower()
+            id_norm = _normalize_identity_text(id_local)
+            if id_norm:
+                normalized_candidates.setdefault(id_norm, set()).add(dev.id)
+    for norm_key, dev_ids in normalized_candidates.items():
+        if norm_key and len(dev_ids) == 1:
+            mapping.setdefault(f"norm:{norm_key}", next(iter(dev_ids)))
     return mapping
 
 
@@ -370,7 +994,7 @@ def _fetch_github_issue_pr_interactions(
     if not owner or not repo:
         return []
 
-    token = os.environ.get("GITHUB_TOKEN", "").strip()
+    token = _effective_github_token()
     timeout_sec = 6
 
     def gh_get(url: str) -> Optional[Any]:
@@ -390,7 +1014,7 @@ def _fetch_github_issue_pr_interactions(
             return None
 
     def add_pairwise_interactions(participants: set, ts: datetime, out: List[Tuple[str, str, datetime]], seen: set):
-        ids = sorted({login_to_dev_id.get(p.lower()) for p in participants if p and login_to_dev_id.get(p.lower())})
+        ids = sorted({_resolve_dev_id_from_login(p, login_to_dev_id) for p in participants if _resolve_dev_id_from_login(p, login_to_dev_id)})
         ids = [x for x in ids if x]
         if len(ids) < 2:
             return
@@ -492,6 +1116,203 @@ def _fetch_github_issue_pr_interactions(
     return interactions
 
 
+def _fetch_github_issue_pr_text_signals(
+    project_url: str,
+    start: datetime,
+    end_exclusive: datetime,
+    login_to_dev_id: Dict[str, str],
+) -> List[Dict[str, Any]]:
+    owner, repo = _parse_github_owner_repo(project_url)
+    if not owner or not repo:
+        return []
+
+    token = _effective_github_token()
+    timeout_sec = 6
+
+    def gh_get(url: str) -> Optional[Any]:
+        headers = {
+            "Accept": "application/vnd.github+json",
+            "User-Agent": "community-smells-hub",
+        }
+        if token:
+            headers["Authorization"] = f"Bearer {token}"
+        req = Request(url, headers=headers, method="GET")
+        try:
+            with urlopen(req, timeout=timeout_sec) as res:
+                if int(res.status) != 200:
+                    return None
+                return json.loads(res.read().decode("utf-8", errors="ignore"))
+        except Exception:
+            return None
+
+    def add_signal(
+        out: List[Dict[str, Any]],
+        login: str,
+        ts: Optional[datetime],
+        parts: List[str],
+        *,
+        source_id: str,
+        source_label: str,
+        source_url: str,
+        source_type: str,
+        is_open: bool,
+        thread_id: str,
+        thread_label: str,
+        thread_url: str,
+        thread_is_open: bool,
+    ):
+        if not ts or ts < start or ts >= end_exclusive:
+            return
+        dev_id = _resolve_dev_id_from_login(login, login_to_dev_id)
+        if not dev_id:
+            return
+        text = " ".join(x.strip() for x in parts if isinstance(x, str) and x.strip())
+        if text:
+            out.append({
+                "developer_id": dev_id,
+                "timestamp": ts,
+                "text": text[:3000],
+                "source_id": source_id,
+                "source_label": source_label[:180],
+                "source_url": source_url,
+                "source_type": source_type,
+                "is_open": bool(is_open),
+                "thread_id": thread_id,
+                "thread_label": thread_label[:180],
+                "thread_url": thread_url,
+                "thread_is_open": bool(thread_is_open),
+            })
+
+    signals: List[Dict[str, Any]] = []
+    since_iso = start.isoformat() + "Z"
+    repo_web = _github_repo_web_base(project_url)
+
+    for page in range(1, 6):
+        issues = gh_get(
+            f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues"
+            f"?state=all&since={quote(since_iso)}&per_page=100&page={page}&sort=updated&direction=asc"
+        )
+        if not isinstance(issues, list) or not issues:
+            break
+
+        for issue in issues:
+            if not isinstance(issue, dict):
+                continue
+            number = issue.get("number")
+            if not number:
+                continue
+            issue_ts = _parse_github_datetime(issue.get("updated_at") or issue.get("created_at"))
+            if not issue_ts or issue_ts < start or issue_ts >= end_exclusive:
+                continue
+            is_pr = "pull_request" in issue
+            thread_type = "pr" if is_pr else "issue"
+            thread_id = f"{thread_type}:{number}"
+            issue_title = str(issue.get("title") or f"{thread_type.upper()} #{number}")
+            thread_label = f"{'PR' if is_pr else 'Issue'} #{number}: {issue_title}"
+            thread_url = str(issue.get("html_url") or f"{repo_web}/{ 'pull' if is_pr else 'issues' }/{number}")
+            thread_is_open = str(issue.get("state") or "").strip().lower() == "open"
+
+            iu = issue.get("user") or {}
+            ilogin = str(iu.get("login") or "").strip()
+            add_signal(
+                signals,
+                ilogin,
+                issue_ts,
+                [str(issue.get("title") or ""), str(issue.get("body") or "")],
+                source_id=thread_id,
+                source_label=thread_label,
+                source_url=thread_url,
+                source_type="pull_request" if is_pr else "issue",
+                is_open=thread_is_open,
+                thread_id=thread_id,
+                thread_label=thread_label,
+                thread_url=thread_url,
+                thread_is_open=thread_is_open,
+            )
+
+            comments = gh_get(
+                f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/issues/{number}/comments?per_page=100"
+            )
+            if isinstance(comments, list):
+                for c in comments:
+                    if not isinstance(c, dict):
+                        continue
+                    cts = _parse_github_datetime(c.get("created_at"))
+                    cu = c.get("user") or {}
+                    clogin = str(cu.get("login") or "").strip()
+                    comment_id = str(c.get("id") or "")
+                    add_signal(
+                        signals,
+                        clogin,
+                        cts,
+                        [str(c.get("body") or "")],
+                        source_id=f"{thread_id}:comment:{comment_id or 'x'}",
+                        source_label=f"{thread_label} comment",
+                        source_url=str(c.get("html_url") or thread_url),
+                        source_type="issue_comment",
+                        is_open=thread_is_open,
+                        thread_id=thread_id,
+                        thread_label=thread_label,
+                        thread_url=thread_url,
+                        thread_is_open=thread_is_open,
+                    )
+
+            if is_pr:
+                reviews = gh_get(
+                    f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/reviews?per_page=100"
+                )
+                if isinstance(reviews, list):
+                    for r in reviews:
+                        if not isinstance(r, dict):
+                            continue
+                        rts = _parse_github_datetime(r.get("submitted_at") or r.get("created_at"))
+                        ru = r.get("user") or {}
+                        rlogin = str(ru.get("login") or "").strip()
+                        add_signal(
+                            signals,
+                            rlogin,
+                            rts,
+                            [str(r.get("state") or ""), str(r.get("body") or "")],
+                            source_id=f"{thread_id}:review:{str(r.get('id') or 'x')}",
+                            source_label=f"{thread_label} review",
+                            source_url=str(r.get("html_url") or thread_url),
+                            source_type="review",
+                            is_open=thread_is_open,
+                            thread_id=thread_id,
+                            thread_label=thread_label,
+                            thread_url=thread_url,
+                            thread_is_open=thread_is_open,
+                        )
+
+                pr_comments = gh_get(
+                    f"https://api.github.com/repos/{quote(owner)}/{quote(repo)}/pulls/{number}/comments?per_page=100"
+                )
+                if isinstance(pr_comments, list):
+                    for c in pr_comments:
+                        if not isinstance(c, dict):
+                            continue
+                        pts = _parse_github_datetime(c.get("created_at"))
+                        pu = c.get("user") or {}
+                        plogin = str(pu.get("login") or "").strip()
+                        add_signal(
+                            signals,
+                            plogin,
+                            pts,
+                            [str(c.get("body") or "")],
+                            source_id=f"{thread_id}:pr_comment:{str(c.get('id') or 'x')}",
+                            source_label=f"{thread_label} inline comment",
+                            source_url=str(c.get("html_url") or thread_url),
+                            source_type="pr_comment",
+                            is_open=thread_is_open,
+                            thread_id=thread_id,
+                            thread_label=thread_label,
+                            thread_url=thread_url,
+                            thread_is_open=thread_is_open,
+                        )
+
+    return signals
+
+
 def _infer_gender_from_bio(bio: str, pronoun_sets: Dict[str, set]) -> Tuple[str, float, List[str]]:
     if not bio:
         return "Unknown", 0.0, []
@@ -545,7 +1366,7 @@ class GitHubGenderResolver:
         self.owner, self.repo = _parse_github_owner_repo(project_url)
         self.pronoun_sets = _load_pronoun_sets()
         self.timeout_sec = 4
-        self.github_token = os.environ.get("GITHUB_TOKEN", "").strip()
+        self.github_token = _effective_github_token()
         self.max_profile_lookups = max(0, int(os.environ.get("GITHUB_PROFILE_LOOKUP_LIMIT", "120")))
         self.lookup_count = 0
         self.user_cache: Dict[str, Optional[Dict[str, Any]]] = {}
@@ -764,6 +1585,44 @@ def _safe_div(num: float, den: float) -> float:
         return float(num) / float(den)
     except Exception:
         return 0.0
+
+
+def _estimate_window_eta_seconds(
+    project: Project,
+    started_windows_at: datetime,
+    processed_windows: int,
+    total_windows: int,
+) -> Optional[int]:
+    if total_windows <= 0:
+        return None
+    remaining = max(total_windows - processed_windows, 0)
+    if remaining <= 0:
+        return 0
+
+    sec_per_window: Optional[float] = None
+    if processed_windows > 0:
+        elapsed = max((datetime.now() - started_windows_at).total_seconds(), 1.0)
+        sec_per_window = elapsed / float(processed_windows)
+    elif (project.last_analysis_duration_seconds or 0) > 0 and (project.last_analysis_window_count or 0) > 0:
+        sec_per_window = float(project.last_analysis_duration_seconds) / float(project.last_analysis_window_count)
+    else:
+        sec_per_window = float(os.environ.get("ANALYSIS_DEFAULT_SEC_PER_WINDOW", "25"))
+
+    eta = int(max(5, round(remaining * max(sec_per_window, 1.0))))
+    return min(eta, 72 * 3600)
+
+
+def _set_analysis_progress(
+    project: Project,
+    progress_pct: float,
+    eta_seconds: Optional[int],
+    window_index: int,
+    window_total: int,
+) -> None:
+    project.analysis_progress_pct = max(0.0, min(100.0, float(progress_pct)))
+    project.analysis_eta_seconds = int(eta_seconds) if eta_seconds is not None else None
+    project.analysis_window_index = max(0, int(window_index))
+    project.analysis_window_total = max(0, int(window_total))
 
 
 def _avg_mapping_value(values: Dict[str, float]) -> float:
@@ -1083,14 +1942,13 @@ def _ensure_project_repo_available(project: Project) -> None:
             "Delete the folder or update project path, then retry."
         )
 
-    cmd = ["git", "clone", project.url, repo_path]
     try:
-        subprocess.run(cmd, check=True, capture_output=True, text=True)
-    except subprocess.CalledProcessError as e:
-        details = (e.stderr or e.stdout or str(e)).strip()
+        _git_clone_with_timeout(project.url, repo_path)
+    except ValueError as e:
+        raise FileNotFoundError(str(e)) from e
+    except Exception as e:
         raise RuntimeError(
-            f"Failed to clone repository from {project.url} to {repo_path}. "
-            f"Git said: {details[:700]}"
+            f"Failed to clone repository from {project.url} to {repo_path}. {e}"
         ) from e
 
 
@@ -1202,8 +2060,50 @@ def _sanitize_repo_slug(url: str) -> str:
     return slug or f"repo-{uuid.uuid4().hex[:8]}"
 
 
+def _resolve_dpy_binary() -> Optional[str]:
+    candidates: List[str] = []
+    env_path = (os.environ.get("DPY_BINARY", "") or "").strip()
+    if env_path:
+        candidates.append(os.path.expanduser(env_path))
+
+    name_candidates = [
+        "DPy",
+        "dpy",
+        "DPy-linux",
+        "DPy-linux-x86_64",
+        "DPy-linux-amd64",
+        "DPy.Linux.x86_64",
+        "DPy.exe",
+    ]
+    for name in name_candidates:
+        candidates.append(os.path.join(RESOURCE_ROOT, name))
+
+    for cmd_name in ("DPy", "dpy"):
+        path_in_path = shutil.which(cmd_name)
+        if path_in_path:
+            candidates.append(path_in_path)
+
+    seen: set = set()
+    for raw in candidates:
+        p = os.path.abspath(raw)
+        if p in seen:
+            continue
+        seen.add(p)
+        if not os.path.isfile(p):
+            continue
+        if not os.access(p, os.X_OK):
+            try:
+                mode = os.stat(p).st_mode
+                os.chmod(p, mode | 0o111)
+            except Exception:
+                pass
+        if os.access(p, os.X_OK):
+            return p
+    return None
+
+
 def _allocate_repo_folder(repo_slug: str) -> str:
-    base = os.path.join(PROJECT_ROOT, "data", "projects")
+    base = PROJECTS_ROOT
     os.makedirs(base, exist_ok=True)
     candidate = os.path.join(base, repo_slug)
     if not os.path.exists(candidate):
@@ -1216,7 +2116,61 @@ def _allocate_repo_folder(repo_slug: str) -> str:
         idx += 1
 
 
-def _create_project_record(name: str, url: str = "", local_path: str = "") -> Project:
+def _looks_like_missing_repo_error(stderr_text: str) -> bool:
+    txt = (stderr_text or "").lower()
+    markers = [
+        "repository not found",
+        "not found",
+        "does not exist",
+        "could not find repository",
+        "remote repository is empty",
+        "fatal: repository",
+    ]
+    return any(m in txt for m in markers)
+
+
+def _git_clone_with_timeout(url: str, dest_path: str) -> None:
+    timeout_sec = int(os.environ.get("GIT_CLONE_TIMEOUT_SEC", "180"))
+    cmd = ["git", "clone", "--", url, dest_path]
+    try:
+        res = subprocess.run(
+            cmd,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=max(timeout_sec, 10),
+        )
+    except subprocess.TimeoutExpired:
+        raise RuntimeError(
+            f"Clone timed out after {timeout_sec}s for '{url}'. "
+            "Repository may be unavailable or too large."
+        )
+    except Exception as e:
+        raise RuntimeError(f"Clone failed for '{url}': {e}")
+
+    if res.returncode == 0:
+        return
+
+    stderr_text = (res.stderr or res.stdout or "").strip()
+    if _looks_like_missing_repo_error(stderr_text):
+        raise ValueError(
+            f"Repository unavailable or removed: {url}. "
+            f"Git said: {stderr_text[:400]}"
+        )
+    raise RuntimeError(
+        f"Failed to clone '{url}' (exit {res.returncode}). "
+        f"Git said: {stderr_text[:700]}"
+    )
+
+
+def _create_project_record(
+    name: str,
+    url: str = "",
+    local_path: str = "",
+    expected_generation: Optional[int] = None,
+) -> Project:
+    if _is_generation_cancelled(expected_generation):
+        raise AnalysisCancelled("Import cancelled by Delete All Projects.")
     project_id = str(uuid.uuid4())
 
     if local_path and os.path.isabs(local_path):
@@ -1228,8 +2182,7 @@ def _create_project_record(name: str, url: str = "", local_path: str = "") -> Pr
         folder_name = local_path.strip("/") if local_path else repo_slug
         final_path = _allocate_repo_folder(folder_name)
         if not os.path.exists(final_path):
-            from git import Repo
-            Repo.clone_from(url, final_path)
+            _git_clone_with_timeout(url, final_path)
     else:
         raise ValueError("Provide either a Git URL or an absolute local path.")
 
@@ -1240,8 +2193,19 @@ def _create_project_record(name: str, url: str = "", local_path: str = "") -> Pr
         local_path=final_path,
         analysis_status="None",
     )
-    projects_db[project_id] = project
-    save_projects(projects_db)
+    if _is_generation_cancelled(expected_generation):
+        # Prevent resurrecting projects while global cleanup is in progress.
+        if url and os.path.exists(final_path):
+            try:
+                shutil.rmtree(final_path, ignore_errors=True)
+            except Exception:
+                pass
+        raise AnalysisCancelled("Import cancelled by Delete All Projects.")
+    with _PROJECTS_DB_LOCK:
+        if _is_generation_cancelled(expected_generation):
+            raise AnalysisCancelled("Import cancelled by Delete All Projects.")
+        projects_db[project_id] = project
+        save_projects(projects_db)
     return project
 
 
@@ -1256,25 +2220,21 @@ class BulkCreateRequest(BaseModel):
     auto_analyze: bool = True
 
 
-@app.post("/projects", response_model=Project)
-async def create_project(name: str, url: str = "", local_path: str = ""):
-    try:
-        return _create_project_record(name=name, url=url, local_path=local_path)
-    except ValueError as e:
-        raise HTTPException(status_code=400, detail=str(e))
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Failed to create project '{name}': {str(e)}")
-
-
-@app.post("/projects/bulk")
-async def create_projects_bulk(payload: BulkCreateRequest, background_tasks: BackgroundTasks):
-    if not payload.repositories:
+def _create_projects_from_items(
+    items: List[BulkRepoItem],
+    auto_analyze: bool,
+    expected_generation: Optional[int] = None,
+) -> Dict[str, Any]:
+    if not items:
         raise HTTPException(status_code=400, detail="No repositories provided.")
 
-    created: List[Dict[str, str]] = []
-    errors: List[Dict[str, str]] = []
-
-    for idx, item in enumerate(payload.repositories):
+    def worker(idx: int, item: BulkRepoItem) -> Dict[str, Any]:
+        if _is_generation_cancelled(expected_generation):
+            return {
+                "ok": False,
+                "index": idx,
+                "row": {"index": str(idx), "url": "", "name": "", "error": "Cancelled by Delete All Projects"},
+            }
         url = (item.url or "").strip()
         local_path = (item.local_path or "").strip()
         name = (item.name or "").strip()
@@ -1288,93 +2248,724 @@ async def create_projects_bulk(payload: BulkCreateRequest, background_tasks: Bac
                 name = f"repo-{idx + 1}"
 
         try:
-            project = _create_project_record(name=name, url=url, local_path=local_path)
+            project = _create_project_record(
+                name=name,
+                url=url,
+                local_path=local_path,
+                expected_generation=expected_generation,
+            )
 
-            if payload.auto_analyze:
-                project.analysis_status = "Running"
-                background_tasks.add_task(run_full_analysis, project.id)
+            if auto_analyze and not _is_generation_cancelled(expected_generation):
+                with _PROJECTS_DB_LOCK:
+                    if project.id in projects_db:
+                        project.analysis_status = "Queued"
+                        project.ml_detection_status = "Queued for analysis..."
+                        _set_analysis_progress(project, 0.0, None, 0, 0)
+                        save_projects(projects_db)
+                _enqueue_analysis(project.id, generation=expected_generation)
 
-            created.append({
-                "id": project.id,
-                "name": project.name,
-                "url": project.url,
-                "status": project.analysis_status,
-            })
+            return {
+                "ok": True,
+                "index": idx,
+                "row": {
+                    "id": project.id,
+                    "name": project.name,
+                    "url": project.url,
+                    "status": project.analysis_status,
+                },
+            }
+        except AnalysisCancelled as e:
+            return {
+                "ok": False,
+                "index": idx,
+                "row": {"index": str(idx), "url": url, "name": name, "error": str(e)},
+            }
         except ValueError as e:
-            errors.append({
-                "index": str(idx),
-                "url": url,
-                "name": name,
-                "error": str(e),
-            })
+            return {
+                "ok": False,
+                "index": idx,
+                "row": {"index": str(idx), "url": url, "name": name, "error": str(e)},
+            }
         except Exception as e:
-            errors.append({
-                "index": str(idx),
-                "url": url,
-                "name": name,
-                "error": str(e),
-            })
+            return {
+                "ok": False,
+                "index": idx,
+                "row": {"index": str(idx), "url": url, "name": name, "error": str(e)},
+            }
 
-    if payload.auto_analyze and created:
-        save_projects(projects_db)
+    workers = max(
+        1,
+        min(
+            _read_parallelism_env("IMPORT_PARALLELISM", _adaptive_import_parallelism()),
+            len(items),
+        ),
+    )
+    results: List[Dict[str, Any]] = []
+    if workers <= 1 or len(items) <= 1:
+        for idx, item in enumerate(items):
+            results.append(worker(idx, item))
+    else:
+        with ThreadPoolExecutor(max_workers=workers) as ex:
+            futs = [ex.submit(worker, idx, item) for idx, item in enumerate(items)]
+            for fut in as_completed(futs):
+                results.append(fut.result())
+
+    results.sort(key=lambda x: int(x.get("index", 0)))
+    created = [r["row"] for r in results if r.get("ok")]
+    errors = [r["row"] for r in results if not r.get("ok")]
 
     return {
-        "requested": len(payload.repositories),
-        "auto_analyze": payload.auto_analyze,
+        "requested": len(items),
+        "auto_analyze": auto_analyze,
         "created": created,
         "errors": errors,
     }
 
 
+def _import_items_background(
+    items: List[BulkRepoItem],
+    auto_analyze: bool,
+    expected_generation: Optional[int] = None,
+) -> None:
+    try:
+        _create_projects_from_items(items, auto_analyze, expected_generation=expected_generation)
+    except Exception:
+        print("Background CSV import failed:")
+        print(traceback.format_exc())
+
+
+@app.post("/projects", response_model=Project)
+async def create_project(name: str, url: str = "", local_path: str = ""):
+    try:
+        return _create_project_record(name=name, url=url, local_path=local_path)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to create project '{name}': {str(e)}")
+
+
+def _build_demo_conflict_project(name: str = "Demo Conflict Playground") -> Project:
+    now = datetime.now()
+    start = now - timedelta(days=30)
+    end = now
+    project_id = str(uuid.uuid4())
+
+    dev_se = Developer(
+        id="alice_se@example.com",
+        aliases=["alice-se"],
+        emails=["alice_se@example.com"],
+        classification="Software Engineer",
+        commits_count=14,
+        bug_fix_commits_count=3,
+        bug_introduced_count=1,
+        files_touched_count=18,
+        lines_added=620,
+        lines_deleted=210,
+        code_churn=830,
+    )
+    dev_ml = Developer(
+        id="bob_ml@example.com",
+        aliases=["bob-ml"],
+        emails=["bob_ml@example.com"],
+        classification="AI/ML Engineer",
+        commits_count=11,
+        bug_fix_commits_count=2,
+        bug_introduced_count=2,
+        files_touched_count=15,
+        lines_added=510,
+        lines_deleted=260,
+        code_churn=770,
+    )
+    dev_hybrid = Developer(
+        id="carla_hybrid@example.com",
+        aliases=["carla-hybrid"],
+        emails=["carla_hybrid@example.com"],
+        classification="Hybrid",
+        commits_count=17,
+        bug_fix_commits_count=4,
+        bug_introduced_count=1,
+        files_touched_count=22,
+        lines_added=890,
+        lines_deleted=340,
+        code_churn=1230,
+    )
+    developers = [dev_se, dev_ml, dev_hybrid]
+
+    edges = [
+        {"from": 0, "to": 1, "weight": 4},
+        {"from": 0, "to": 2, "weight": 3},
+        {"from": 1, "to": 2, "weight": 5},
+    ]
+
+    metrics = ProjectMetrics(
+        project_id=project_id,
+        time_window="demo-window",
+        loc=18240,
+        nom=1290,
+        community_smells_count={"lone_wolf": 1},
+        ml_smells_count={"data_leakage": 2},
+        traditional_smells_count={"LongMethod": 3},
+        vulnerabilities_count={"B101": 1},
+        vulnerabilities_severity_count={"HIGH": 1},
+        abandoned_developers_count=0,
+        abandoned_developers_ids=[],
+    )
+    window = ProjectTimeWindow(
+        id="demo-window",
+        label="Demo Window",
+        start_date=start,
+        end_date=end,
+        developers=developers,
+        metrics=metrics,
+        collaboration_edges=edges,
+    )
+
+    trace_a = TraceabilityLink(
+        source_id="issue:42:comment:1",
+        label="Issue #42 comment disagreement",
+        url="https://github.com/example/demo/issues/42",
+        source_type="issue_comment",
+        is_open=True,
+    )
+    trace_b = TraceabilityLink(
+        source_id="pr:77:review:2",
+        label="PR #77 changes requested",
+        url="https://github.com/example/demo/pull/77",
+        source_type="review",
+        is_open=False,
+    )
+    trace_c = TraceabilityLink(
+        source_id="pr:81:comment:5",
+        label="PR #81 contested architecture choice",
+        url="https://github.com/example/demo/pull/81",
+        source_type="pr_comment",
+        is_open=True,
+    )
+
+    topic_modeling = TopicModelingResult(
+        status="Completed (Demo)",
+        model="demo-synthetic",
+        judge_model="demo-synthetic-judge",
+        generated_at=now,
+        source_count=36,
+        discussion_source_count=28,
+        llm_run_count=1,
+        judged=True,
+        source_breakdown={
+            "issue_comment": 10,
+            "pr_comment": 12,
+            "review": 6,
+            "commit_message": 8,
+        },
+        taxonomy_notes=[
+            "This is a synthetic dataset created to validate graph rendering of conflicts and topics.",
+        ],
+        roles=[
+            RoleTopicTree(
+                role="Software Engineer",
+                documents_count=12,
+                summary="SE discussions focus on delivery risk and refactoring tradeoffs.",
+                topics=[
+                    TopicNode(
+                        name="Release Gatekeeping",
+                        summary="SE contributors debated stability thresholds before release.",
+                        evidence_count=3,
+                        subtopics=[
+                            TopicSubtopic(
+                                name="Rollback Policy",
+                                summary="Different opinions on rollback triggers.",
+                                evidence_count=3,
+                                trace_links=[trace_a, trace_b],
+                            )
+                        ],
+                        trace_links=[trace_a],
+                    )
+                ],
+            ),
+            RoleTopicTree(
+                role="AI/ML Engineer",
+                documents_count=11,
+                summary="ML discussions concentrate on model quality and data constraints.",
+                topics=[
+                    TopicNode(
+                        name="Data Validation",
+                        summary="ML contributors pushed for stricter validation checks.",
+                        evidence_count=2,
+                        trace_links=[trace_a, trace_c],
+                    )
+                ],
+            ),
+            RoleTopicTree(
+                role="Hybrid",
+                documents_count=13,
+                summary="Hybrid contributors bridge architecture and model concerns.",
+                topics=[
+                    TopicNode(
+                        name="Pipeline Ownership",
+                        summary="Hybrid developers debated ownership of feature pipelines.",
+                        evidence_count=2,
+                        trace_links=[trace_c],
+                    )
+                ],
+            ),
+        ],
+        developers=[
+            DeveloperTopicProfile(
+                developer_id=dev_se.id,
+                role="Software Engineer",
+                documents_count=10,
+                summary="Frequent participation in release and code quality debates.",
+                topics=[
+                    TopicNode(
+                        name="Release Gatekeeping",
+                        summary="Argued for strict merge criteria.",
+                        evidence_count=2,
+                        trace_links=[trace_b],
+                    )
+                ],
+                trace_links=[trace_b],
+            ),
+            DeveloperTopicProfile(
+                developer_id=dev_ml.id,
+                role="AI/ML Engineer",
+                documents_count=9,
+                summary="Focused on model reliability and data integrity.",
+                topics=[
+                    TopicNode(
+                        name="Data Validation",
+                        summary="Insisted on stronger validation before deploy.",
+                        evidence_count=2,
+                        trace_links=[trace_a],
+                    )
+                ],
+                trace_links=[trace_a],
+            ),
+            DeveloperTopicProfile(
+                developer_id=dev_hybrid.id,
+                role="Hybrid",
+                documents_count=11,
+                summary="Bridged platform and ML concerns during design reviews.",
+                topics=[
+                    TopicNode(
+                        name="Pipeline Ownership",
+                        summary="Challenged unclear ownership boundaries.",
+                        evidence_count=2,
+                        trace_links=[trace_c],
+                    )
+                ],
+                trace_links=[trace_c],
+            ),
+        ],
+        conflicts=[
+            DeveloperConflictRecord(
+                conflict_title="Model rollback criteria",
+                developer_id=dev_se.id,
+                developer_role="Software Engineer",
+                counterpart_id=dev_ml.id,
+                counterpart_role="AI/ML Engineer",
+                participant_ids=[dev_se.id, dev_ml.id],
+                participant_roles=["Software Engineer", "AI/ML Engineer"],
+                role_combination="Software Engineer x AI/ML Engineer",
+                status="open",
+                summary="Disagreement on rollback thresholds for model degradation.",
+                resolution_summary="Not yet resolved; discussion remains active in issue thread.",
+                evidence_count=3,
+                open_conflict=True,
+                primary_link=trace_a,
+                source_links=[trace_a, trace_b],
+            ),
+            DeveloperConflictRecord(
+                conflict_title="Code ownership boundaries",
+                developer_id=dev_se.id,
+                developer_role="Software Engineer",
+                counterpart_id=dev_hybrid.id,
+                counterpart_role="Hybrid",
+                participant_ids=[dev_se.id, dev_hybrid.id],
+                participant_roles=["Software Engineer", "Hybrid"],
+                role_combination="Software Engineer x Hybrid",
+                status="resolved",
+                summary="Debate on who should own integration-layer modules.",
+                resolution_summary="Resolved by defining ownership in PR template and CODEOWNERS.",
+                evidence_count=2,
+                open_conflict=False,
+                primary_link=trace_b,
+                source_links=[trace_b],
+            ),
+            DeveloperConflictRecord(
+                conflict_title="Hybrid architecture dispute",
+                developer_id=dev_hybrid.id,
+                developer_role="Hybrid",
+                counterpart_id=dev_hybrid.id,
+                counterpart_role="Hybrid",
+                participant_ids=[dev_hybrid.id],
+                participant_roles=["Hybrid"],
+                role_combination="Hybrid",
+                status="open",
+                summary="Conflicting proposals among hybrid maintainers on pipeline design.",
+                resolution_summary="Pending decision in open PR discussion.",
+                evidence_count=2,
+                open_conflict=True,
+                primary_link=trace_c,
+                source_links=[trace_c],
+            ),
+        ],
+        potential_conflict_threads=[
+            PotentialConflictThread(
+                thread_id="issue:99",
+                thread_label="Issue #99 deployment regression",
+                thread_url="https://github.com/example/demo/issues/99",
+                source_type="issue",
+                is_open=True,
+                participant_ids=[dev_se.id, dev_ml.id, dev_hybrid.id],
+                participant_roles=["Software Engineer", "AI/ML Engineer", "Hybrid"],
+                matched_signals=["blocked", "changes_requested", "concern"],
+                summary="Heuristic candidate thread with repeated blocking language.",
+                source_links=[trace_a, trace_c],
+            )
+        ],
+    )
+
+    return Project(
+        id=project_id,
+        name=name,
+        url="demo://conflict-playground",
+        local_path=PROJECT_ROOT,
+        last_analyzed=now,
+        analysis_status="Completed",
+        analysis_progress_pct=100.0,
+        analysis_eta_seconds=0,
+        analysis_window_index=1,
+        analysis_window_total=1,
+        last_analysis_duration_seconds=1.0,
+        last_analysis_window_count=1,
+        ml_detection_status="Completed (Demo)",
+        developers=developers,
+        metrics=[metrics],
+        collaboration_edges=edges,
+        time_windows=[window],
+        active_time_window_id=window.id,
+        topic_modeling=topic_modeling,
+    )
+
+
+@app.post("/projects/demo/conflicts", response_model=Project)
+async def create_demo_conflict_project(name: str = "Demo Conflict Playground", replace_existing: bool = True):
+    demo_url = "demo://conflict-playground"
+    with _PROJECTS_DB_LOCK:
+        if replace_existing:
+            existing_ids = [pid for pid, project in projects_db.items() if str(project.url or "").strip() == demo_url]
+            for project_id in existing_ids:
+                projects_db.pop(project_id, None)
+                _delete_topic_documents(project_id)
+        demo_project = _build_demo_conflict_project(name=name)
+        projects_db[demo_project.id] = demo_project
+        _save_topic_documents(
+            demo_project.id,
+            [
+                {
+                    "project_id": demo_project.id,
+                    "project_name": demo_project.name,
+                    "time_window_id": "demo-window",
+                    "time_window_label": "Demo Window",
+                    "source_id": "issue:42:comment:1",
+                    "source_label": "Issue #42 comment disagreement",
+                    "source_url": "https://github.com/example/demo/issues/42",
+                    "source_type": "issue_comment",
+                    "is_open": True,
+                    "thread_id": "issue:42",
+                    "thread_label": "Issue #42 rollback criteria",
+                    "thread_url": "https://github.com/example/demo/issues/42",
+                    "thread_is_open": True,
+                    "developer_id": "alice_se@example.com",
+                    "role": "Software Engineer",
+                    "text": "We should block release until rollback criteria are explicit.",
+                    "timestamp": datetime.now().isoformat(),
+                }
+            ],
+        )
+        save_projects(projects_db)
+    _invalidate_global_topics_cache()
+    return demo_project
+
+
+@app.post("/projects/bulk")
+async def create_projects_bulk(
+    payload: BulkCreateRequest,
+    background_tasks: BackgroundTasks,
+    async_import: bool = False,
+):
+    generation = _get_workflow_generation()
+    if async_import:
+        background_tasks.add_task(_import_items_background, payload.repositories, payload.auto_analyze, generation)
+        return {
+            "mode": "async",
+            "message": "Bulk import started in background",
+            "requested": len(payload.repositories or []),
+            "auto_analyze": payload.auto_analyze,
+        }
+    return _create_projects_from_items(
+        payload.repositories,
+        payload.auto_analyze,
+        expected_generation=generation,
+    )
+
+
+@app.post("/projects/import/csv")
+async def import_projects_csv(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    auto_analyze: bool = Form(True),
+    async_import: bool = Form(True),
+):
+    filename = (file.filename or "").lower()
+    if not filename.endswith(".csv"):
+        raise HTTPException(status_code=400, detail="Please upload a .csv file.")
+
+    try:
+        raw = await file.read()
+        text = raw.decode("utf-8-sig", errors="ignore")
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=f"Failed to read CSV file: {e}")
+
+    reader = csv.DictReader(io.StringIO(text))
+    if not reader.fieldnames:
+        raise HTTPException(status_code=400, detail="CSV file has no header.")
+
+    lowered = {str(h).strip().lower(): h for h in reader.fieldnames if h}
+
+    def get_col(*names: str) -> Optional[str]:
+        for n in names:
+            if n in lowered:
+                return lowered[n]
+        return None
+
+    url_col = get_col("url", "repo_url", "repository_url", "git_url")
+    name_col = get_col("name", "project_name")
+    local_path_col = get_col("local_path", "path", "repo_path")
+
+    if not url_col and not local_path_col:
+        raise HTTPException(
+            status_code=400,
+            detail="CSV must contain at least one column among: url/repo_url/repository_url/git_url or local_path/path/repo_path.",
+        )
+
+    items: List[BulkRepoItem] = []
+    for row in reader:
+        if not isinstance(row, dict):
+            continue
+        url = str(row.get(url_col, "") or "").strip() if url_col else ""
+        name = str(row.get(name_col, "") or "").strip() if name_col else ""
+        local_path = str(row.get(local_path_col, "") or "").strip() if local_path_col else ""
+        if not url and not local_path:
+            continue
+        items.append(BulkRepoItem(url=url, name=name or None, local_path=local_path))
+
+    if not items:
+        raise HTTPException(status_code=400, detail="No valid rows found in CSV.")
+
+    generation = _get_workflow_generation()
+    if async_import:
+        background_tasks.add_task(_import_items_background, items, auto_analyze, generation)
+        return {
+            "mode": "async",
+            "message": "CSV import started in background",
+            "requested": len(items),
+            "auto_analyze": auto_analyze,
+        }
+
+    return _create_projects_from_items(items, auto_analyze, expected_generation=generation)
+
+
+@app.get("/settings/llm", response_model=LLMSettingsResponse)
+async def get_llm_settings():
+    return _build_llm_settings_response()
+
+
+@app.put("/settings/llm", response_model=LLMSettingsResponse)
+async def update_llm_settings(payload: LLMSettingsUpdateRequest):
+    current = _load_llm_settings_raw()
+
+    if payload.clear_api_key:
+        current["api_key"] = ""
+    elif payload.api_key is not None and str(payload.api_key).strip():
+        current["api_key"] = str(payload.api_key).strip()
+
+    if payload.clear_github_token:
+        current["github_token"] = ""
+    elif payload.github_token is not None and str(payload.github_token).strip():
+        current["github_token"] = str(payload.github_token).strip()
+
+    if payload.model is not None:
+        current["model"] = str(payload.model).strip() or "gpt-5-mini"
+    if payload.llm_runs is not None:
+        try:
+            current["llm_runs"] = max(1, min(7, int(payload.llm_runs)))
+        except Exception:
+            current["llm_runs"] = 1
+    if payload.organization is not None:
+        current["organization"] = str(payload.organization).strip()
+    if payload.project is not None:
+        current["project"] = str(payload.project).strip()
+    if payload.endpoint is not None:
+        current["endpoint"] = str(payload.endpoint).strip() or "https://api.openai.com/v1/chat/completions"
+
+    _save_llm_settings_raw(current)
+    _invalidate_global_topics_cache()
+    return _build_llm_settings_response()
+
+
 @app.get("/projects", response_model=List[Project])
 async def list_projects():
-    return list(projects_db.values())
+    with _PROJECTS_DB_LOCK:
+        return list(projects_db.values())
+
+
+@app.delete("/projects")
+async def delete_all_projects():
+    _bump_workflow_generation()
+    with _RUNNING_ANALYSES_LOCK:
+        for fut in list(_ANALYSIS_FUTURES.values()):
+            fut.cancel()
+        _ANALYSIS_FUTURES.clear()
+        _RUNNING_ANALYSES.clear()
+
+    with _PROJECTS_DB_LOCK:
+        unique_paths = {p.local_path for p in projects_db.values() if p.local_path}
+    deleted_folders = 0
+
+    managed_root = os.path.normpath(PROJECTS_ROOT)
+    for local_path in unique_paths:
+        try:
+            if not os.path.exists(local_path):
+                continue
+            local_norm = os.path.normpath(local_path)
+            if os.path.commonpath([managed_root, local_norm]) != managed_root:
+                continue
+            shutil.rmtree(local_path)
+            deleted_folders += 1
+        except Exception as e:
+            print(f"Failed to remove {local_path}: {e}")
+
+    with _PROJECTS_DB_LOCK:
+        deleted_projects = len(projects_db)
+        topic_project_ids = list(projects_db.keys())
+        projects_db.clear()
+        save_projects(projects_db)
+    for project_id in topic_project_ids:
+        _delete_topic_documents(project_id)
+    _invalidate_global_topics_cache()
+    return {
+        "message": "All projects deleted successfully",
+        "projects_deleted": deleted_projects,
+        "folders_deleted": deleted_folders,
+    }
 
 
 @app.delete("/projects/{project_id}")
 async def delete_project(project_id: str):
-    if project_id not in projects_db:
-        raise HTTPException(status_code=404, detail="Project not found")
+    with _PROJECTS_DB_LOCK:
+        if project_id not in projects_db:
+            raise HTTPException(status_code=404, detail="Project not found")
 
-    project = projects_db[project_id]
-    used_by_other_projects = any(
-        (p.id != project_id and p.local_path == project.local_path)
-        for p in projects_db.values()
-    )
-    if (
-        os.path.exists(project.local_path)
-        and "data/projects" in project.local_path
-        and not used_by_other_projects
-    ):
+        project = projects_db[project_id]
+        used_by_other_projects = any(
+            (p.id != project_id and p.local_path == project.local_path)
+            for p in projects_db.values()
+        )
+    managed_root = os.path.normpath(PROJECTS_ROOT)
+    local_norm = os.path.normpath(project.local_path or "")
+    should_delete_managed = False
+    if local_norm and os.path.exists(local_norm):
+        try:
+            should_delete_managed = os.path.commonpath([managed_root, local_norm]) == managed_root
+        except Exception:
+            should_delete_managed = False
+
+    if should_delete_managed and not used_by_other_projects:
         try:
             shutil.rmtree(project.local_path)
         except Exception as e:
             print(f"Failed to remove {project.local_path}: {e}")
 
-    del projects_db[project_id]
-    save_projects(projects_db)
+    with _PROJECTS_DB_LOCK:
+        if project_id in projects_db:
+            del projects_db[project_id]
+            save_projects(projects_db)
+    _delete_topic_documents(project_id)
+    _invalidate_global_topics_cache()
     return {"message": "Project deleted successfully"}
 
 
 @app.post("/projects/{project_id}/analyze")
-async def start_analysis(project_id: str, background_tasks: BackgroundTasks):
+async def start_analysis(project_id: str):
     if project_id not in projects_db:
         raise HTTPException(status_code=404, detail="Project not found")
 
     project = projects_db[project_id]
-    project.analysis_status = "Running"
+    project.analysis_status = "Queued"
+    project.ml_detection_status = "Queued for analysis..."
+    _set_analysis_progress(project, 0.0, None, 0, 0)
     # Keep previous windows visible while the new analysis is running.
     save_projects(projects_db)
 
-    background_tasks.add_task(run_full_analysis, project_id)
-    return {"message": "Analysis started", "project_id": project_id}
+    queued = _enqueue_analysis(project_id)
+    if queued:
+        return {"message": "Analysis queued", "project_id": project_id}
+    return {"message": "Analysis already running or queued", "project_id": project_id}
 
 
-def run_full_analysis(project_id: str):
-    project = projects_db[project_id]
+@app.post("/projects/analyze-all")
+async def start_analysis_all(force_reanalyze: bool = False):
+    queued_count = 0
+    skipped_completed = 0
+    already_running_or_queued = 0
+    touched = False
+
+    for project in projects_db.values():
+        has_existing_results = bool(project.last_analyzed) or bool(project.time_windows) or bool(project.developers) or bool(project.metrics)
+        if has_existing_results and not force_reanalyze:
+            skipped_completed += 1
+            continue
+
+        if project.analysis_status in {"Running", "Queued", "Queued for automatic resume"}:
+            already_running_or_queued += 1
+            continue
+
+        project.analysis_status = "Queued"
+        project.ml_detection_status = "Queued for analysis..."
+        _set_analysis_progress(project, 0.0, None, 0, 0)
+        if _enqueue_analysis(project.id):
+            queued_count += 1
+            touched = True
+        else:
+            already_running_or_queued += 1
+
+    if touched:
+        save_projects(projects_db)
+
+    return {
+        "message": "Batch analysis scheduling completed",
+        "queued": queued_count,
+        "skipped_completed": skipped_completed,
+        "already_running_or_queued": already_running_or_queued,
+        "analysis_parallelism": _ANALYSIS_MAX_WORKERS,
+    }
+
+
+def run_full_analysis(project_id: str, expected_generation: Optional[int] = None):
+    if _is_generation_cancelled(expected_generation):
+        return
+    project = projects_db.get(project_id)
+    if not project:
+        # Project may have been deleted before background task starts.
+        return
     history_repo_path: Optional[str] = None
+    analysis_started_at = datetime.now()
 
     try:
+        if _is_generation_cancelled(expected_generation):
+            raise AnalysisCancelled("Analysis cancelled by Delete All Projects.")
+        _set_analysis_progress(project, 2.0, None, 0, 0)
         _ensure_project_repo_available(project)
 
         project.ml_detection_status = "Pending"
@@ -1389,6 +2980,7 @@ def run_full_analysis(project_id: str):
         commits = miner.list_commits()
         all_developers = miner.get_developers()
 
+        _set_analysis_progress(project, 8.0, None, 0, 0)
         project.ml_detection_status = "Resolving developer profiles..."
         save_projects(projects_db)
         GitHubGenderResolver(project.url).annotate_developers(all_developers)
@@ -1396,14 +2988,20 @@ def run_full_analysis(project_id: str):
         base_dev_by_id: Dict[str, Developer] = {d.id: d for d in all_developers}
         email_to_dev_id = _build_email_to_dev_id(all_developers)
 
-        project.ml_detection_status = "Running historical 3-month analysis..."
+        _set_analysis_progress(project, 12.0, None, 0, 0)
+        project.ml_detection_status = "Running historical monthly analysis..."
         save_projects(projects_db)
 
-        dpy_binary = os.path.join(PROJECT_ROOT, "DPy")
+        dpy_binary = _resolve_dpy_binary()
         traditional_analyzer = TraditionalSmellAnalyzer(dpy_binary=dpy_binary)
+        if not dpy_binary:
+            print(
+                "DPy binary not found/executable. "
+                "Set DPY_BINARY to your Linux binary path or place it in RESOURCE_ROOT."
+            )
         vuln_analyzer = BanditVulnerabilityAnalyzer()
-        ml_analyzer = MLSmellAnalyzer()
-        sentiment_analyzer = DeveloperSentimentAnalyzer(os.path.join(PROJECT_ROOT, "SE_Emotion_PTM-3589"))
+        ml_analyzer = MLSmellAnalyzer(os.path.join(RESOURCE_ROOT, "smell_ai"))
+        sentiment_analyzer = DeveloperSentimentAnalyzer(os.path.join(RESOURCE_ROOT, "SE_Emotion_PTM-3589"))
 
         project.ml_detection_status = "Preparing developer sentiment model..."
         save_projects(projects_db)
@@ -1411,15 +3009,27 @@ def run_full_analysis(project_id: str):
         if not sentiment_ready and sentiment_analyzer.last_error:
             print(f"Developer sentiment disabled: {sentiment_analyzer.last_error}")
 
-        windows = _build_three_month_windows(commits)
+        base_window_months = 1
+        windows = _build_time_windows(commits, months_per_window=base_window_months)
+        total_windows = len(windows)
+        _set_analysis_progress(project, 18.0, _estimate_window_eta_seconds(project, datetime.now(), 0, total_windows), 0, total_windows)
+        save_projects(projects_db)
         commits_sorted_asc = sorted(commits, key=lambda c: c.date)
         login_to_dev_id = _build_login_to_dev_id_map(all_developers)
+        login_to_dev_id = _augment_login_to_dev_id_map_with_github_contributors(project.url, all_developers, login_to_dev_id)
+        repo_web_base = _github_repo_web_base(project.url)
 
         project_start = windows[0]["start"] if windows else datetime.now()
-        project_end = windows[-1]["end_exclusive"] if windows else (project_start + timedelta(days=90))
+        project_end = windows[-1]["end_exclusive"] if windows else _add_months(project_start, base_window_months)
         project.ml_detection_status = "Collecting PR/Issue communication..."
         save_projects(projects_db)
         gh_interactions_all = _fetch_github_issue_pr_interactions(
+            project.url,
+            project_start,
+            project_end,
+            login_to_dev_id,
+        )
+        gh_text_signals_all = _fetch_github_issue_pr_text_signals(
             project.url,
             project_start,
             project_end,
@@ -1434,14 +3044,39 @@ def run_full_analysis(project_id: str):
             snapshot_commit = commits_sorted_asc[cursor - 1] if cursor > 0 else None
             w["snapshot_commit_hash"] = snapshot_commit.hash if snapshot_commit else None
 
+        window_activity_ids: List[set] = []
+        all_known_dev_ids: set = {d.id for d in all_developers if d.id}
+        for w in windows:
+            start = w["start"]
+            end_exclusive = w["end_exclusive"]
+            commit_authors = {c.author_id for c in commits_sorted_asc if c.author_id and start <= c.date < end_exclusive}
+            comm_participants = {
+                actor_id
+                for (src, dst, ts) in gh_interactions_all
+                for actor_id in (src, dst)
+                if actor_id and start <= ts < end_exclusive
+            }
+            active_ids = set(commit_authors) | set(comm_participants)
+            window_activity_ids.append(active_ids)
+            all_known_dev_ids.update(active_ids)
+
+        last_active_window_idx: Dict[str, int] = {}
+        for idx, active_ids in enumerate(window_activity_ids):
+            for dev_id in active_ids:
+                last_active_window_idx[dev_id] = idx
+
         snapshots: List[ProjectTimeWindow] = []
         classifier = DeveloperClassifier()
         rszz = RSZZAnalyzer(project.local_path)
         snapshot_cache: Dict[str, Dict[str, Any]] = {}
         prev_table3_state: Optional[Dict[str, set]] = None
+        windows_started_at = datetime.now()
+        latest_commit_by_dev: Dict[str, Commit] = {}
+        interaction_documents: List[Dict[str, Any]] = []
+        checkpoint_partial_results = project.last_analyzed is None
 
         # R-SZZ is expensive: compute bug-inducing commits once, then assign each
-        # event to its corresponding 3-month window.
+        # event to its corresponding historical window.
         all_bic_hashes = rszz.identify_bug_inducing_commits(commits_sorted_asc)
         commit_by_hash = {c.hash: c for c in commits_sorted_asc}
         bic_events: List[Tuple[datetime, str]] = []
@@ -1455,22 +3090,46 @@ def run_full_analysis(project_id: str):
         history_repo_path = _clone_repo_for_history(project.local_path)
 
         for idx, w in enumerate(windows):
+            if _is_generation_cancelled(expected_generation):
+                raise AnalysisCancelled("Analysis cancelled by Delete All Projects.")
             start = w["start"]
             end_exclusive = w["end_exclusive"]
             is_latest_window = idx == (len(windows) - 1)
             snapshot_hash = str(w.get("snapshot_commit_hash") or "")
             window_commits = [c for c in commits_sorted_asc if start <= c.date < end_exclusive]
+            window_latest_commit_by_dev: Dict[str, Commit] = {}
+            for c in window_commits:
+                if not c.author_id:
+                    continue
+                prev_commit = window_latest_commit_by_dev.get(c.author_id)
+                if prev_commit is None or c.date > prev_commit.date:
+                    window_latest_commit_by_dev[c.author_id] = c
+            latest_commit_by_dev.update(window_latest_commit_by_dev)
             snapshot_result: Dict[str, Any]
 
             if snapshot_hash:
                 cached = snapshot_cache.get(snapshot_hash)
                 if cached is None:
                     _checkout_ref(history_repo_path, snapshot_hash)
+                    processed_windows = idx
+                    eta_seconds = _estimate_window_eta_seconds(project, windows_started_at, processed_windows, total_windows)
+                    _set_analysis_progress(
+                        project,
+                        20.0 + (70.0 * (float(processed_windows) / float(max(total_windows, 1)))),
+                        eta_seconds,
+                        processed_windows,
+                        total_windows,
+                    )
                     project.ml_detection_status = f"Analyzing {w['label']} ({idx + 1}/{len(windows)})"
                     save_projects(projects_db)
 
                     snap_ml = ml_analyzer.analyze_directory(history_repo_path, None)
                     snap_traditional = traditional_analyzer.analyze_directory(history_repo_path, email_to_dev_id)
+                    if traditional_analyzer.last_error:
+                        print(
+                            f"DPy warning ({w['label']}): "
+                            f"{traditional_analyzer.last_status} - {traditional_analyzer.last_error}"
+                        )
                     snap_vulnerabilities = vuln_analyzer.analyze_directory(history_repo_path, email_to_dev_id)
 
                     ml_enriched = _attribute_instances_to_developers(
@@ -1558,7 +3217,24 @@ def run_full_analysis(project_id: str):
                 window_bug_counts[author_id] = window_bug_counts.get(author_id, 0) + 1
                 bic_cursor += 1
 
-            classifier.classify_developers(window_developers, window_commits)
+            window_gh_text_by_dev: Dict[str, List[str]] = {}
+            window_gh_text_docs: List[Dict[str, Any]] = []
+            for signal in gh_text_signals_all:
+                if not isinstance(signal, dict):
+                    continue
+                dev_id = str(signal.get("developer_id") or "").strip()
+                ts = signal.get("timestamp")
+                txt = str(signal.get("text") or "").strip()
+                if dev_id and txt and isinstance(ts, datetime) and start <= ts < end_exclusive:
+                    window_gh_text_by_dev.setdefault(dev_id, []).append(txt)
+                    window_gh_text_docs.append(signal)
+
+            classifier.classify_developers(
+                window_developers,
+                window_commits,
+                repo_root=history_repo_path,
+                gh_text_by_dev=window_gh_text_by_dev,
+            )
             _fill_developer_stats(window_developers, window_commits, window_bug_counts)
             if sentiment_ready:
                 sentiment_analyzer.analyze_developers(window_developers, window_commits)
@@ -1595,6 +3271,55 @@ def run_full_analysis(project_id: str):
                 dev.vulnerability_details = []
 
             dev_by_id = {d.id: d for d in window_developers}
+
+            for c in window_commits:
+                dev = dev_by_id.get(c.author_id)
+                if not dev or not c.message:
+                    continue
+                doc = _build_interaction_document(
+                    project=project,
+                    window_meta=w,
+                    source_type="commit_message",
+                    developer_id=c.author_id,
+                    role=dev.classification,
+                    text=c.message,
+                    timestamp=c.date,
+                    source_id=f"commit:{c.hash}",
+                    source_label=f"Commit {str(c.hash or '')[:7]}",
+                    source_url=f"{repo_web_base}/commit/{c.hash}" if repo_web_base and c.hash else "",
+                    is_open=False,
+                    thread_id=f"commit:{c.hash}",
+                    thread_label=f"Commit {str(c.hash or '')[:7]}",
+                    thread_url=f"{repo_web_base}/commit/{c.hash}" if repo_web_base and c.hash else "",
+                    thread_is_open=False,
+                )
+                if doc:
+                    interaction_documents.append(doc)
+
+            for signal in window_gh_text_docs:
+                dev_id = str(signal.get("developer_id") or "").strip()
+                dev = dev_by_id.get(dev_id)
+                if not dev:
+                    continue
+                doc = _build_interaction_document(
+                    project=project,
+                    window_meta=w,
+                    source_type=str(signal.get("source_type") or "issue_pr"),
+                    developer_id=dev_id,
+                    role=dev.classification,
+                    text=str(signal.get("text") or ""),
+                    timestamp=signal.get("timestamp"),
+                    source_id=str(signal.get("source_id") or ""),
+                    source_label=str(signal.get("source_label") or ""),
+                    source_url=str(signal.get("source_url") or ""),
+                    is_open=bool(signal.get("is_open")),
+                    thread_id=str(signal.get("thread_id") or ""),
+                    thread_label=str(signal.get("thread_label") or ""),
+                    thread_url=str(signal.get("thread_url") or ""),
+                    thread_is_open=bool(signal.get("thread_is_open")),
+                )
+                if doc:
+                    interaction_documents.append(doc)
 
             for s in community_smells:
                 for entity_id in s.affected_entities:
@@ -1653,6 +3378,55 @@ def run_full_analysis(project_id: str):
 
             window_developers.sort(key=lambda d: (-(d.commits_count or 0), d.id))
 
+            abandoned_ids: List[str] = sorted(
+                [
+                    dev_id
+                    for dev_id in all_known_dev_ids
+                    if dev_id and dev_id in last_active_window_idx and last_active_window_idx[dev_id] < idx
+                ]
+            )
+
+            for dev in window_developers:
+                last_idx = last_active_window_idx.get(dev.id)
+                if last_idx is not None and 0 <= last_idx < len(windows):
+                    dev.last_interaction_window_id = windows[last_idx]["id"]
+                    dev.last_interaction_window_label = windows[last_idx]["label"]
+                else:
+                    dev.last_interaction_window_id = None
+                    dev.last_interaction_window_label = None
+
+                dev.is_abandoned = bool(last_idx is not None and last_idx < idx)
+                dev.abandonment_status = "Abandoned" if dev.is_abandoned else "Active"
+                last_commit = latest_commit_by_dev.get(dev.id)
+                if last_commit:
+                    dev.last_commit_hash = last_commit.hash
+                    dev.last_commit_date = last_commit.date
+                    dev.last_commit_message = last_commit.message
+                else:
+                    dev.last_commit_hash = None
+                    dev.last_commit_date = None
+                    dev.last_commit_message = None
+                if dev.is_abandoned:
+                    abandon_idx = int(last_idx + 1) if last_idx is not None else idx
+                    if 0 <= abandon_idx < len(windows):
+                        dev.abandoned_since_window_id = windows[abandon_idx]["id"]
+                        dev.abandoned_since_window_label = windows[abandon_idx]["label"]
+                        dev.abandoned_since_date = windows[abandon_idx]["start"]
+                    else:
+                        dev.abandoned_since_window_id = windows[idx]["id"]
+                        dev.abandoned_since_window_label = windows[idx]["label"]
+                        dev.abandoned_since_date = windows[idx]["start"]
+                    dev.last_message_before_abandonment_hash = dev.last_commit_hash
+                    dev.last_message_before_abandonment_date = dev.last_commit_date
+                    dev.last_message_before_abandonment = dev.last_commit_message
+                else:
+                    dev.abandoned_since_window_id = None
+                    dev.abandoned_since_window_label = None
+                    dev.abandoned_since_date = None
+                    dev.last_message_before_abandonment_hash = None
+                    dev.last_message_before_abandonment_date = None
+                    dev.last_message_before_abandonment = None
+
             dev_id_to_idx = {dev.id: i for i, dev in enumerate(window_developers)}
             edges = []
             for u, v, data in nb.collaboration_graph.edges(data=True):
@@ -1700,6 +3474,8 @@ def run_full_analysis(project_id: str):
                 sev = (v.severity or "UNSPECIFIED").upper()
                 p_metrics.vulnerabilities_severity_count[sev] = p_metrics.vulnerabilities_severity_count.get(sev, 0) + 1
             p_metrics.table3_metrics = table3_metrics
+            p_metrics.abandoned_developers_count = len(abandoned_ids)
+            p_metrics.abandoned_developers_ids = abandoned_ids
 
             snapshots.append(ProjectTimeWindow(
                 id=w["id"],
@@ -1711,8 +3487,35 @@ def run_full_analysis(project_id: str):
                 collaboration_edges=edges,
             ))
 
+            processed_windows = idx + 1
+            eta_seconds = _estimate_window_eta_seconds(project, windows_started_at, processed_windows, total_windows)
+            _set_analysis_progress(
+                project,
+                20.0 + (70.0 * (float(processed_windows) / float(max(total_windows, 1)))),
+                eta_seconds,
+                processed_windows,
+                total_windows,
+            )
+            if checkpoint_partial_results:
+                project.time_windows = list(snapshots)
+                latest_partial = snapshots[-1] if snapshots else None
+                project.active_time_window_id = latest_partial.id if latest_partial else None
+                if latest_partial:
+                    project.developers = latest_partial.developers
+                    project.metrics = [latest_partial.metrics]
+                    project.collaboration_edges = latest_partial.collaboration_edges
+                else:
+                    project.developers = []
+                    project.metrics = []
+                    project.collaboration_edges = []
+                _save_topic_documents(project.id, interaction_documents)
+            save_projects(projects_db)
+
+        if _is_generation_cancelled(expected_generation):
+            raise AnalysisCancelled("Analysis cancelled by Delete All Projects.")
         project.time_windows = snapshots
         _validate_time_windows(project.time_windows)
+        _save_topic_documents(project.id, interaction_documents)
         latest_window = snapshots[-1] if snapshots else None
         project.active_time_window_id = latest_window.id if latest_window else None
 
@@ -1725,16 +3528,51 @@ def run_full_analysis(project_id: str):
             project.metrics = []
             project.collaboration_edges = []
 
+        try:
+            project.ml_detection_status = "Extracting role topics..."
+            save_projects(projects_db)
+            topic_analyzer = RoleTopicModelingAnalyzer(config=_effective_llm_config())
+            project.topic_modeling = topic_analyzer.analyze_documents(interaction_documents, scope_label=project.name)
+        except Exception as e:
+            project.topic_modeling = TopicModelingResult(
+                status="Error",
+                model=os.environ.get("SMELLHUB_TOPIC_MODEL", "gpt-5-mini"),
+                generated_at=datetime.now(),
+                source_count=len(interaction_documents),
+                error=str(e),
+            )
+
         project.analysis_status = "Completed"
+        total_elapsed = max((datetime.now() - analysis_started_at).total_seconds(), 0.0)
+        project.last_analysis_duration_seconds = float(round(total_elapsed, 2))
+        project.last_analysis_window_count = int(total_windows)
+        _set_analysis_progress(project, 100.0, 0, total_windows, total_windows)
         project.last_analyzed = datetime.now()
+        _invalidate_global_topics_cache()
         save_projects(projects_db)
 
+    except AnalysisCancelled as e:
+        if project_id in projects_db:
+            project.ml_detection_status = "Cancelled"
+            project.ml_detection_error = str(e)
+            project.analysis_status = "Cancelled"
+            _set_analysis_progress(project, 0.0, None, 0, int(project.analysis_window_total or 0))
+            save_projects(projects_db)
+    except FileNotFoundError as e:
+        print("run_full_analysis repository unavailable:")
+        print(traceback.format_exc())
+        project.ml_detection_status = "Repository unavailable"
+        project.ml_detection_error = str(e)
+        project.analysis_status = f"Error: Repository unavailable ({str(e)})"
+        _set_analysis_progress(project, 0.0, None, 0, int(project.analysis_window_total or 0))
+        save_projects(projects_db)
     except Exception as e:
         print("run_full_analysis failed:")
         print(traceback.format_exc())
         project.ml_detection_status = "Historical analysis failed"
         project.ml_detection_error = str(e)
         project.analysis_status = f"Error: {str(e)}"
+        _set_analysis_progress(project, 0.0, None, 0, int(project.analysis_window_total or 0))
         save_projects(projects_db)
     finally:
         if history_repo_path and os.path.exists(history_repo_path):
@@ -1748,112 +3586,278 @@ async def get_project(project_id: str):
     return projects_db[project_id]
 
 
-@app.get("/projects/{project_id}/developers/export.csv")
-async def export_developers_csv(
-    project_id: str,
-    window_id: Optional[str] = None,
-    all_windows: bool = False,
-):
+@app.post("/projects/{project_id}/topics/analyze", response_model=TopicModelingResult)
+async def analyze_project_topics(project_id: str):
     if project_id not in projects_db:
         raise HTTPException(status_code=404, detail="Project not found")
 
     project = projects_db[project_id]
+    documents = _collect_llm_only_documents(project)
+    analyzer = RoleTopicModelingAnalyzer(config=_effective_llm_config())
+    result = analyzer.analyze_documents(documents, scope_label=project.name)
+    project.topic_modeling = result
+    save_projects(projects_db)
+    _invalidate_global_topics_cache()
+    return result
 
-    sio = io.StringIO()
-    writer = csv.writer(sio)
-    writer.writerow([
-        "time_window_id",
-        "time_window_label",
-        "time_window_start",
-        "time_window_end",
-        "project_loc",
-        "project_nom",
-        "project_community_smells_total",
-        "project_ml_smells_total",
-        "project_traditional_smells_total",
-        "project_vulnerabilities_total",
-        "project_vulnerabilities_high",
-        "project_vulnerabilities_medium",
-        "project_vulnerabilities_low",
-        "project_collaboration_edges_count",
-        "project_community_smells_count_json",
-        "project_ml_smells_count_json",
-        "project_traditional_smells_count_json",
-        "project_vulnerabilities_count_json",
-        "project_vulnerabilities_severity_count_json",
-        "Socio-Technical Quality Factors",
-        "developer_id",
-        "aliases",
-        "emails",
-        "classification",
-        "gender",
-        "gender_confidence",
-        "gender_source",
-        "pronouns_detected",
-        "sentiment_label",
-        "sentiment_score",
-        "sentiment_messages_count",
-        "se_score",
-        "ai_score",
-        "ml_score",
-        "commits_count",
-        "bug_fix_commits_count",
-        "files_touched_count",
-        "lines_added",
-        "lines_deleted",
-        "code_churn",
-        "avg_files_per_commit",
-        "bug_introduced_count_rszz",
-        "community_smells",
-        "community_smell_count",
-        "ml_smells",
-        "ml_smell_count",
-        "ml_smell_instances",
-        "traditional_smells",
-        "traditional_smell_count",
-        "traditional_smell_instances",
-        "vulnerabilities",
-        "vulnerability_count",
-        "vulnerability_instances",
-        "vulnerability_high",
-        "vulnerability_medium",
-        "vulnerability_low",
-    ])
+
+@app.get("/topics/overall", response_model=TopicModelingResult)
+async def get_overall_topics():
+    with _GLOBAL_TOPICS_LOCK:
+        return _GLOBAL_TOPICS_CACHE
+
+
+@app.post("/topics/overall/analyze", response_model=TopicModelingResult)
+async def analyze_overall_topics():
+    global _GLOBAL_TOPICS_CACHE
+    docs: List[Dict[str, Any]] = []
+    skipped_projects: List[str] = []
+    with _PROJECTS_DB_LOCK:
+        projects = list(projects_db.values())
+    for project in projects:
+        project_docs = _load_topic_documents(project.id)
+        if project_docs:
+            docs.extend(project_docs)
+        else:
+            skipped_projects.append(project.name)
+
+    if not docs:
+        result = TopicModelingResult(
+            status="No cached project LLM data",
+            model=str(_effective_llm_config().get("model") or "gpt-5-mini"),
+            generated_at=datetime.now(),
+            source_count=0,
+            taxonomy_notes=[
+                "Run Project LLM Analysis on one or more projects first, then use Global LLM Analysis to aggregate them."
+            ],
+            error="Global LLM Analysis aggregates only project-level LLM datasets already prepared.",
+        )
+        with _GLOBAL_TOPICS_LOCK:
+            _GLOBAL_TOPICS_CACHE = result
+        return result
+
+    analyzer = RoleTopicModelingAnalyzer(config=_effective_llm_config())
+    result = analyzer.analyze_documents(docs, scope_label="All projects")
+    if skipped_projects:
+        result.taxonomy_notes = list(result.taxonomy_notes or []) + [
+            f"Skipped projects without cached LLM data: {', '.join(skipped_projects[:8])}"
+            + (" ..." if len(skipped_projects) > 8 else "")
+        ]
+    with _GLOBAL_TOPICS_LOCK:
+        _GLOBAL_TOPICS_CACHE = result
+    return result
+
+
+_DEVELOPER_EXPORT_HEADER = [
+    "project_url",
+    "time_window_id",
+    "time_window_label",
+    "time_window_start",
+    "time_window_end",
+    "project_loc",
+    "project_nom",
+    "project_community_smells_total",
+    "project_ml_smells_total",
+    "project_traditional_smells_total",
+    "project_vulnerabilities_total",
+    "project_vulnerabilities_high",
+    "project_vulnerabilities_medium",
+    "project_vulnerabilities_low",
+    "project_abandoned_developers_count",
+    "project_abandoned_developers_ids",
+    "project_collaboration_edges_count",
+    "project_community_smells_count_json",
+    "project_ml_smells_count_json",
+    "project_traditional_smells_count_json",
+    "project_vulnerabilities_count_json",
+    "project_vulnerabilities_severity_count_json",
+    "project_metrics_json",
+    "project_community_smell_instances_json",
+    "project_collaboration_edges_json",
+    "Socio-Technical Quality Factors",
+    "project_topic_status",
+    "project_topic_model",
+    "project_topic_judge_model",
+    "project_topic_generated_at",
+    "project_topic_source_count",
+    "project_topic_discussion_source_count",
+    "project_topic_llm_run_count",
+    "project_topic_judged",
+    "project_topic_source_breakdown_json",
+    "project_topic_taxonomy_notes_json",
+    "project_topic_roles_json",
+    "project_topic_developers_json",
+    "project_topic_conflicts_json",
+    "project_topic_potential_conflict_threads_json",
+    "project_topic_error",
+    "project_topic_modeling_raw_json",
+    "developer_id",
+    "aliases",
+    "emails",
+    "classification",
+    "gender",
+    "gender_confidence",
+    "gender_source",
+    "pronouns_detected",
+    "sentiment_label",
+    "sentiment_score",
+    "sentiment_messages_count",
+    "abandonment_status",
+    "is_abandoned",
+    "last_interaction_window_id",
+    "last_interaction_window_label",
+    "abandoned_since_window_id",
+    "abandoned_since_window_label",
+    "abandoned_since_date",
+    "last_commit_hash",
+    "last_commit_date",
+    "last_commit_message",
+    "last_message_before_abandonment_hash",
+    "last_message_before_abandonment_date",
+    "last_message_before_abandonment",
+    "se_score",
+    "ai_score",
+    "ml_score",
+    "commits_count",
+    "bug_fix_commits_count",
+    "files_touched_count",
+    "lines_added",
+    "lines_deleted",
+    "code_churn",
+    "avg_files_per_commit",
+    "bug_introduced_count_rszz",
+    "community_smells",
+    "community_smell_count",
+    "ml_smells",
+    "ml_smell_count",
+    "ml_smell_instances",
+    "traditional_smells",
+    "traditional_smell_count",
+    "traditional_smell_instances",
+    "vulnerabilities",
+    "vulnerability_count",
+    "vulnerability_instances",
+    "vulnerability_high",
+    "vulnerability_medium",
+    "vulnerability_low",
+    "developer_topic_profile_json",
+    "developer_topic_count",
+    "developer_conflicts_json",
+    "developer_conflict_count",
+    "developer_open_conflict_count",
+    "developer_potential_conflict_threads_json",
+    "developer_potential_conflict_thread_count",
+    "developer_raw_json",
+]
+
+
+def _write_project_developer_rows(
+    writer: csv.writer,
+    project: Project,
+    window_id: Optional[str] = None,
+    all_windows: bool = False,
+) -> None:
+    def _to_json_data(obj):
+        if obj is None:
+            return {}
+        if hasattr(obj, "model_dump"):
+            return obj.model_dump(mode="json")
+        if hasattr(obj, "dict"):
+            return obj.dict()
+        return obj
+
+    topic_profiles_by_developer: Dict[str, Dict[str, Any]] = {}
+    conflicts_by_developer: Dict[str, List[Dict[str, Any]]] = {}
+    potential_threads_by_developer: Dict[str, List[Dict[str, Any]]] = {}
+    topic_modeling = getattr(project, "topic_modeling", None)
+    topic_modeling_json: Dict[str, Any] = _to_json_data(topic_modeling) if topic_modeling else {}
+    topic_roles_json: List[Dict[str, Any]] = []
+    topic_developers_json: List[Dict[str, Any]] = []
+    topic_conflicts_json: List[Dict[str, Any]] = []
+    topic_potential_threads_json: List[Dict[str, Any]] = []
+    if topic_modeling:
+        for role_row in (getattr(topic_modeling, "roles", []) or []):
+            topic_roles_json.append(_to_json_data(role_row))
+
+        for profile in (getattr(topic_modeling, "developers", []) or []):
+            profile_json = _to_json_data(profile)
+            topic_developers_json.append(profile_json)
+            profile_dev_id = str(getattr(profile, "developer_id", "") or "").strip()
+            if not profile_dev_id:
+                continue
+            topic_profiles_by_developer[profile_dev_id.casefold()] = profile_json
+
+        for conflict in (getattr(topic_modeling, "conflicts", []) or []):
+            conflict_json = _to_json_data(conflict)
+            topic_conflicts_json.append(conflict_json)
+            participant_ids = [
+                str(pid or "").strip()
+                for pid in (getattr(conflict, "participant_ids", []) or [])
+                if str(pid or "").strip()
+            ]
+            involved_ids = {
+                str(getattr(conflict, "developer_id", "") or "").strip(),
+                str(getattr(conflict, "counterpart_id", "") or "").strip(),
+                *participant_ids,
+            }
+            for involved_id in involved_ids:
+                if not involved_id:
+                    continue
+                conflicts_by_developer.setdefault(involved_id.casefold(), []).append(conflict_json)
+
+        for thread in (getattr(topic_modeling, "potential_conflict_threads", []) or []):
+            thread_json = _to_json_data(thread)
+            topic_potential_threads_json.append(thread_json)
+            participant_ids = [
+                str(pid or "").strip()
+                for pid in (getattr(thread, "participant_ids", []) or [])
+                if str(pid or "").strip()
+            ]
+            for participant_id in participant_ids:
+                potential_threads_by_developer.setdefault(participant_id.casefold(), []).append(thread_json)
 
     rows = []
     if all_windows:
-        for tw in (project.time_windows or []):
+        for idx, tw in enumerate(project.time_windows or []):
             rows.append({
+                "window_idx": idx,
                 "window_id": tw.id,
                 "window_label": tw.label,
                 "window_start": tw.start_date.isoformat() if tw.start_date else "",
                 "window_end": tw.end_date.isoformat() if tw.end_date else "",
-                "developers": tw.developers or [],
+                "developers": _window_export_developers(project, idx, tw.developers or []),
                 "metrics": tw.metrics,
                 "edges_count": len(tw.collaboration_edges or []),
+                "collaboration_edges": tw.collaboration_edges or [],
             })
     else:
         window = _resolve_window(project, window_id)
         if window:
+            resolved_idx = next((idx for idx, tw in enumerate(project.time_windows or []) if tw.id == window.id), None)
             rows.append({
+                "window_idx": resolved_idx,
                 "window_id": window.id,
                 "window_label": window.label,
                 "window_start": window.start_date.isoformat() if window.start_date else "",
                 "window_end": window.end_date.isoformat() if window.end_date else "",
-                "developers": window.developers or [],
+                "developers": _window_export_developers(project, resolved_idx, window.developers or []),
                 "metrics": window.metrics,
                 "edges_count": len(window.collaboration_edges or []),
+                "collaboration_edges": window.collaboration_edges or [],
             })
         else:
             latest_metrics = project.metrics[0] if project.metrics else None
+            latest_idx = len(project.time_windows or []) - 1 if (project.time_windows or []) else None
             rows.append({
+                "window_idx": latest_idx,
                 "window_id": "latest",
                 "window_label": "latest",
                 "window_start": "",
                 "window_end": "",
-                "developers": project.developers or [],
+                "developers": _window_export_developers(project, latest_idx, project.developers or []),
                 "metrics": latest_metrics,
                 "edges_count": len(project.collaboration_edges or []),
+                "collaboration_edges": project.collaboration_edges or [],
             })
 
     for row in rows:
@@ -1864,9 +3868,19 @@ async def export_developers_csv(
         vulnerabilities_count = dict(getattr(metrics, "vulnerabilities_count", {}) or {})
         vulnerabilities_severity_count = dict(getattr(metrics, "vulnerabilities_severity_count", {}) or {})
         table3_metrics = dict(getattr(metrics, "table3_metrics", {}) or {})
+        metrics_json = _to_json_data(metrics)
+        community_smell_instances = list(getattr(metrics, "community_smell_instances", []) or [])
+        collaboration_edges = list(row.get("collaboration_edges") or [])
 
         for dev in (row.get("developers") or []):
+            dev_key = str(dev.id or "").strip().casefold()
+            dev_topic_profile = topic_profiles_by_developer.get(dev_key, {})
+            dev_topics = list((dev_topic_profile or {}).get("topics", []) or [])
+            dev_conflicts = list(conflicts_by_developer.get(dev_key, []) or [])
+            dev_open_conflicts = sum(1 for conflict in dev_conflicts if bool(conflict.get("open_conflict", False)))
+            dev_potential_threads = list(potential_threads_by_developer.get(dev_key, []) or [])
             writer.writerow([
+                project.url or "",
                 row["window_id"],
                 row["window_label"],
                 row["window_start"],
@@ -1880,13 +3894,34 @@ async def export_developers_csv(
                 int(vulnerabilities_severity_count.get("HIGH", 0)),
                 int(vulnerabilities_severity_count.get("MEDIUM", 0)),
                 int(vulnerabilities_severity_count.get("LOW", 0)),
+                int(getattr(metrics, "abandoned_developers_count", 0) or 0),
+                " | ".join(getattr(metrics, "abandoned_developers_ids", []) or []),
                 int(row.get("edges_count", 0) or 0),
                 json.dumps(community_smells_count, ensure_ascii=True),
                 json.dumps(ml_smells_count, ensure_ascii=True),
                 json.dumps(traditional_smells_count, ensure_ascii=True),
                 json.dumps(vulnerabilities_count, ensure_ascii=True),
                 json.dumps(vulnerabilities_severity_count, ensure_ascii=True),
+                json.dumps(metrics_json, ensure_ascii=True),
+                json.dumps(community_smell_instances, ensure_ascii=True),
+                json.dumps(collaboration_edges, ensure_ascii=True),
                 json.dumps(table3_metrics, ensure_ascii=True),
+                str(topic_modeling_json.get("status", "")),
+                str(topic_modeling_json.get("model", "")),
+                str(topic_modeling_json.get("judge_model", "")),
+                str(topic_modeling_json.get("generated_at", "")),
+                int(topic_modeling_json.get("source_count", 0) or 0),
+                int(topic_modeling_json.get("discussion_source_count", 0) or 0),
+                int(topic_modeling_json.get("llm_run_count", 0) or 0),
+                bool(topic_modeling_json.get("judged", False)),
+                json.dumps(dict(topic_modeling_json.get("source_breakdown", {}) or {}), ensure_ascii=True),
+                json.dumps(list(topic_modeling_json.get("taxonomy_notes", []) or []), ensure_ascii=True),
+                json.dumps(topic_roles_json, ensure_ascii=True),
+                json.dumps(topic_developers_json, ensure_ascii=True),
+                json.dumps(topic_conflicts_json, ensure_ascii=True),
+                json.dumps(topic_potential_threads_json, ensure_ascii=True),
+                str(topic_modeling_json.get("error", "") or ""),
+                json.dumps(topic_modeling_json, ensure_ascii=True),
                 dev.id,
                 " | ".join(dev.aliases),
                 " | ".join(dev.emails),
@@ -1898,6 +3933,19 @@ async def export_developers_csv(
                 dev.sentiment_label,
                 dev.sentiment_score,
                 dev.sentiment_messages_count,
+                dev.abandonment_status,
+                dev.is_abandoned,
+                dev.last_interaction_window_id or "",
+                dev.last_interaction_window_label or "",
+                dev.abandoned_since_window_id or "",
+                dev.abandoned_since_window_label or "",
+                dev.abandoned_since_date.isoformat() if dev.abandoned_since_date else "",
+                dev.last_commit_hash or "",
+                dev.last_commit_date.isoformat() if dev.last_commit_date else "",
+                dev.last_commit_message or "",
+                dev.last_message_before_abandonment_hash or "",
+                dev.last_message_before_abandonment_date.isoformat() if dev.last_message_before_abandonment_date else "",
+                dev.last_message_before_abandonment or "",
                 dev.se_score,
                 dev.ai_score,
                 dev.ml_score,
@@ -1923,9 +3971,34 @@ async def export_developers_csv(
                 sum(1 for x in dev.vulnerability_details if str(x.get("severity", "")).upper() == "HIGH"),
                 sum(1 for x in dev.vulnerability_details if str(x.get("severity", "")).upper() == "MEDIUM"),
                 sum(1 for x in dev.vulnerability_details if str(x.get("severity", "")).upper() == "LOW"),
+                json.dumps(dev_topic_profile, ensure_ascii=True),
+                len(dev_topics),
+                json.dumps(dev_conflicts, ensure_ascii=True),
+                len(dev_conflicts),
+                dev_open_conflicts,
+                json.dumps(dev_potential_threads, ensure_ascii=True),
+                len(dev_potential_threads),
+                json.dumps(_to_json_data(dev), ensure_ascii=True),
             ])
 
-    suffix = "all_history" if all_windows else (rows[0]["window_id"] if rows else "latest")
+
+@app.get("/projects/{project_id}/developers/export.csv")
+async def export_developers_csv(
+    project_id: str,
+    window_id: Optional[str] = None,
+    all_windows: bool = False,
+):
+    if project_id not in projects_db:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    project = projects_db[project_id]
+
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(_DEVELOPER_EXPORT_HEADER)
+    _write_project_developer_rows(writer, project, window_id=window_id, all_windows=all_windows)
+
+    suffix = "all_history" if all_windows else (window_id or "latest")
     filename = f"{project.name.replace(' ', '_')}_developers_{suffix}.csv"
     return Response(
         content=sio.getvalue(),
@@ -1934,7 +4007,33 @@ async def export_developers_csv(
     )
 
 
-frontend_dir = os.path.join(PROJECT_ROOT, "web", "frontend")
+@app.get("/projects/developers/export-all.csv")
+async def export_all_projects_developers_csv(all_windows: bool = True, analyzed_only: bool = True):
+    sio = io.StringIO()
+    writer = csv.writer(sio)
+    writer.writerow(_DEVELOPER_EXPORT_HEADER)
+
+    exported_projects = 0
+    for project in projects_db.values():
+        is_analyzed = bool(project.last_analyzed) or bool(project.time_windows) or bool(project.developers) or bool(project.metrics)
+        if analyzed_only and not is_analyzed:
+            continue
+        _write_project_developer_rows(writer, project, window_id=None, all_windows=all_windows)
+        exported_projects += 1
+
+    if exported_projects == 0:
+        raise HTTPException(status_code=404, detail="No analyzed projects available for export.")
+
+    suffix = "all_history" if all_windows else "latest_only"
+    filename = f"all_projects_developers_{suffix}.csv"
+    return Response(
+        content=sio.getvalue(),
+        media_type="text/csv",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
+
+
+frontend_dir = os.path.join(RESOURCE_ROOT, "web", "frontend")
 os.makedirs(frontend_dir, exist_ok=True)
 app.mount("/", StaticFiles(directory=frontend_dir, html=True), name="frontend")
 

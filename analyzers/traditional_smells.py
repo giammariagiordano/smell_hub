@@ -10,8 +10,10 @@ from models.schemas import SmellInstance
 
 
 class TraditionalSmellAnalyzer:
-    def __init__(self, dpy_binary: str):
+    def __init__(self, dpy_binary: Optional[str]):
         self.dpy_binary = dpy_binary
+        self.last_status: str = "Not started"
+        self.last_error: Optional[str] = None
 
     @staticmethod
     def _smell_id(smell_name: str) -> str:
@@ -58,14 +60,26 @@ class TraditionalSmellAnalyzer:
         try:
             res = subprocess.run(cmd, capture_output=True, text=True, check=True, timeout=120)
             log_text = f"{res.stdout}\n{res.stderr}".lower()
+            self.last_status = "DPy executed"
+            self.last_error = None
             return True, log_text
         except subprocess.CalledProcessError as e:
             log_text = f"{e.stdout}\n{e.stderr}".lower()
+            self.last_status = f"DPy exited with code {e.returncode}"
+            self.last_error = (e.stderr or e.stdout or "").strip()[:800] or "DPy failed"
             return False, log_text
         except subprocess.TimeoutExpired as e:
             log_text = f"{e.stdout}\n{e.stderr}".lower() if (e.stdout or e.stderr) else ""
+            self.last_status = "DPy timeout"
+            self.last_error = "DPy execution timed out after 120s"
             return False, log_text
+        except OSError as e:
+            self.last_status = "DPy execution failed"
+            self.last_error = str(e)
+            return False, ""
         except Exception:
+            self.last_status = "DPy execution failed"
+            self.last_error = "Unexpected DPy execution error"
             return False, ""
 
     @staticmethod
@@ -106,7 +120,20 @@ class TraditionalSmellAnalyzer:
         project_root: str,
         email_to_dev_id: Optional[Dict[str, str]] = None
     ) -> List[SmellInstance]:
+        self.last_status = "Not started"
+        self.last_error = None
+
+        if not self.dpy_binary:
+            self.last_status = "DPy binary not configured"
+            self.last_error = "No DPy binary path configured"
+            return []
         if not os.path.exists(self.dpy_binary):
+            self.last_status = "DPy binary not found"
+            self.last_error = f"Missing file: {self.dpy_binary}"
+            return []
+        if not os.access(self.dpy_binary, os.X_OK):
+            self.last_status = "DPy binary not executable"
+            self.last_error = f"Permission denied (not executable): {self.dpy_binary}"
             return []
 
         with tempfile.TemporaryDirectory(prefix="dpy_", dir="/tmp") as out_dir:
