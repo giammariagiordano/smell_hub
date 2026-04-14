@@ -103,28 +103,28 @@ The frontend is served directly by FastAPI (mounted static files).
 
 ## Build executable (Windows/macOS/Linux)
 
-Non esiste un singolo binario universale per tutti gli OS: va generato un eseguibile per ciascun sistema operativo.
+There is no single universal binary for all operating systems: you must build one executable per target OS.
 
-1. Installa dipendenze runtime + builder:
+1. Install runtime dependencies and the builder:
 
 ```bash
 pip install -r requirements.txt
 pip install pyinstaller
 ```
 
-2. Build eseguibile per il tuo OS:
+2. Build the executable for your OS:
 
 ```bash
 python3 scripts/build_executable.py
 ```
 
-Opzione single-binary:
+Single-binary option:
 
 ```bash
 python3 scripts/build_executable.py --onefile
 ```
 
-3. Avvio:
+3. Run:
 
 - Build `--onedir` (default):
   - macOS/Linux: `./dist/SmellHub/SmellHub`
@@ -133,15 +133,15 @@ python3 scripts/build_executable.py --onefile
   - macOS/Linux: `./dist/SmellHub`
   - Windows: `dist\\SmellHub.exe`
 
-Note operative:
+Operational notes:
 
-- L'eseguibile salva i dati utente in `~/.smellhub` (cross-platform).
-- Al lancio apre automaticamente il browser su `http://127.0.0.1:8001`.
-- Variabili utili:
+- The executable stores user data in `~/.smellhub` (cross-platform).
+- On startup it automatically opens the browser at `http://127.0.0.1:8001`.
+- Useful variables:
   - `SMELLHUB_PORT` (default `8001`)
   - `SMELLHUB_HOST` (default `127.0.0.1`)
   - `SMELLHUB_OPEN_BROWSER` (`1`/`0`)
-  - `SMELLHUB_DATA_DIR` (override path dati)
+  - `SMELLHUB_DATA_DIR` (override data directory)
 
 ## API overview
 
